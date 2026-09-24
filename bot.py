@@ -1,4 +1,6 @@
 import logging
+import asyncio
+import random
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -233,20 +235,59 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
     msg = await interaction.followup.send(embed=status_embed)
 
     results = []
-    for idx, acc in enumerate(targets, start=1):
-        status_embed.description = f"🔄 Rozwiązywanie konta [{idx}/{total}]: **`{acc['login']}`** ({acc.get('language', 'auto').upper()})...\nProszę czekać..."
-        await msg.edit(embed=status_embed)
+    remaining = list(targets)
+    batch_idx = 1
+    done_count = 0
 
-        res = await solver.solve_session(
-            login=acc["login"],
-            password=acc["password"],
-            preferred_lang=acc.get("language", "auto")
+    while remaining:
+        # Losowa wielkość paczki od config.BATCH_SIZE_MIN do config.BATCH_SIZE_MAX (np. 2 do 5)
+        # Jeśli zostało mniej kont, bierzemy wszystkie pozostałe
+        batch_size = random.randint(config.BATCH_SIZE_MIN, config.BATCH_SIZE_MAX)
+        cur_batch = remaining[:batch_size]
+        remaining = remaining[batch_size:]
+
+        logins_str = ", ".join([f"`{a['login']}`" for a in cur_batch])
+        status_embed.description = (
+            f"🔄 **Paczka #{batch_idx}** ({len(cur_batch)} kont naraz):\n"
+            f"{logins_str}\n\n"
+            f"📊 Postęp: **{done_count}/{total}** ukończonych\n"
+            f"⏳ Proszę czekać..."
         )
+        try:
+            await msg.edit(embed=status_embed)
+        except Exception:
+            pass
 
-        if res["success"]:
-            database.update_last_run(interaction.user.id, acc["login"], discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        async def run_single_in_batch(acc, idx_in_batch):
+            # Delikatne rozstrzelenie startu
+            await asyncio.sleep(idx_in_batch * random.uniform(1.5, 4.0))
+            r = await solver.solve_session(
+                login=acc["login"],
+                password=acc["password"],
+                preferred_lang=acc.get("language", "auto")
+            )
+            if r["success"]:
+                database.update_last_run(interaction.user.id, acc["login"], discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+            return (acc["login"], r)
 
-        results.append((acc["login"], res))
+        batch_tasks = [run_single_in_batch(acc, i) for i, acc in enumerate(cur_batch)]
+        batch_res = await asyncio.gather(*batch_tasks)
+        results.extend(batch_res)
+        done_count += len(cur_batch)
+        batch_idx += 1
+
+        if remaining:
+            pause_time = random.uniform(config.BATCH_PAUSE_MIN, config.BATCH_PAUSE_MAX)
+            status_embed.description = (
+                f"☕ **Paczka ukończona!**\n"
+                f"Przerwa {pause_time:.1f}s przed kolejną paczką...\n"
+                f"📊 Postęp: **{done_count}/{total}** ukończonych"
+            )
+            try:
+                await msg.edit(embed=status_embed)
+            except Exception:
+                pass
+            await asyncio.sleep(pause_time)
 
     # Podsumowanie
     success_count = sum(1 for _, r in results if r["success"])
