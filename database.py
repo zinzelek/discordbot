@@ -1,5 +1,6 @@
 import sqlite3
 import os
+from datetime import datetime
 from typing import List, Dict, Optional
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "accounts.db")
@@ -14,26 +15,51 @@ def init_db():
             login TEXT NOT NULL,
             password TEXT NOT NULL,
             language TEXT DEFAULT 'auto',
-            auto_daily INTEGER DEFAULT 0,
+            auto_daily INTEGER DEFAULT 1,
             last_run TEXT,
+            expires_at TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(discord_user_id, login)
         )
     """)
+    # Migracja dla istniejących baz: dodanie kolumny expires_at jeśli jej nie ma
+    try:
+        c.execute("ALTER TABLE accounts ADD COLUMN expires_at TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
-def add_or_update_account(discord_user_id: int, login: str, password: str, language: str = "auto", auto_daily: int = 0):
+def is_account_active(acc: Dict) -> bool:
+    """Sprawdza czy konto nie wygasło czasowo"""
+    expires_at = acc.get("expires_at")
+    if not expires_at or str(expires_at).lower() in ("none", "null", ""):
+        return True  # Na zawsze
+    try:
+        exp_dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() <= exp_dt
+    except Exception:
+        return True
+
+def add_or_update_account(
+    discord_user_id: int,
+    login: str,
+    password: str,
+    language: str = "auto",
+    auto_daily: int = 1,
+    expires_at: Optional[str] = None
+):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
-        INSERT INTO accounts (discord_user_id, login, password, language, auto_daily)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO accounts (discord_user_id, login, password, language, auto_daily, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(discord_user_id, login) DO UPDATE SET
             password = excluded.password,
             language = excluded.language,
-            auto_daily = excluded.auto_daily
-    """, (discord_user_id, login.strip(), password.strip(), language.lower().strip(), auto_daily))
+            auto_daily = excluded.auto_daily,
+            expires_at = excluded.expires_at
+    """, (discord_user_id, login.strip(), password.strip(), language.lower().strip(), auto_daily, expires_at))
     conn.commit()
     conn.close()
 
@@ -66,7 +92,9 @@ def get_all_accounts() -> List[Dict]:
     return rows
 
 def get_all_auto_accounts() -> List[Dict]:
-    return get_all_accounts()
+    """Pobiera tylko aktywne (niewygasłe) konta z włączonym harmonogramem"""
+    all_acc = get_all_accounts()
+    return [a for a in all_acc if is_account_active(a)]
 
 def delete_account(discord_user_id: int, login: str) -> bool:
     conn = sqlite3.connect(DB_FILE)

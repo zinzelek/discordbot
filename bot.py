@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import random
+from datetime import datetime, timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -68,94 +69,113 @@ async def sync_cmd(ctx):
 
 async def has_required_role(interaction: discord.Interaction) -> bool:
     """Sprawdza czy użytkownik posiada wymaganą rangę (lub jest administratorem)"""
-    # 1. Administratorzy serwera mają zawsze pełny dostęp
-    if interaction.guild and isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
-        return True
-
-    # 2. Jeśli ograniczenie rangi jest wyłączone w configu (pusta nazwa i ID 0)
-    if not config.REQUIRED_ROLE_NAME and config.REQUIRED_ROLE_ID == 0:
-        return True
-
-    # 3. Jeśli komenda wywołana na serwerze
-    if isinstance(interaction.user, discord.Member):
-        roles = interaction.user.roles
-        if config.REQUIRED_ROLE_ID != 0 and any(r.id == config.REQUIRED_ROLE_ID for r in roles):
-            return True
-        if config.REQUIRED_ROLE_NAME and any(r.name.lower() == config.REQUIRED_ROLE_NAME.lower() for r in roles):
-            return True
-
-    # 4. Jeśli komenda wywołana w wiadomości prywatnej (DM)
+    # Jeśli bot działa w wiadomości prywatnej (DM)
     if interaction.guild is None:
-        for guild in bot.guilds:
-            member = guild.get_member(interaction.user.id)
-            if member:
-                if member.guild_permissions.administrator:
-                    return True
-                if config.REQUIRED_ROLE_ID != 0 and any(r.id == config.REQUIRED_ROLE_ID for r in member.roles):
-                    return True
-                if config.REQUIRED_ROLE_NAME and any(r.name.lower() == config.REQUIRED_ROLE_NAME.lower() for r in member.roles):
-                    return True
+        return True
 
-    # Brak uprawnień -> wyślij informację
-    role_info = f"**{config.REQUIRED_ROLE_NAME}**" if config.REQUIRED_ROLE_NAME else f"o ID: `{config.REQUIRED_ROLE_ID}`"
-    embed = discord.Embed(
-        title="⛔ Brak Wymaganej Rangi!",
-        description=(
-            f"Nie masz uprawnień do korzystania z bota InstaLing.\n\n"
-            f"👑 Wymagana ranga: {role_info}\n\n"
-            f"Skontaktuj się z administratorem serwera, aby otrzymać dostęp."
-        ),
-        color=discord.Color.red()
-    )
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    # Jeśli w configu nie podano rangi, bot jest otwarty dla każdego
+    req_name = config.REQUIRED_ROLE_NAME.strip().lower()
+    req_id = config.REQUIRED_ROLE_ID
+
+    if not req_name and req_id == 0:
+        return True
+
+    user = interaction.user
+    if not isinstance(user, discord.Member):
+        return True
+
+    # Administratorzy serwera mają zawsze pełny dostęp
+    if user.guild_permissions.administrator:
+        return True
+
+    # Sprawdzenie po ID roli
+    if req_id != 0:
+        for role in user.roles:
+            if role.id == req_id:
+                return True
+
+    # Sprawdzenie po nazwie roli
+    if req_name:
+        for role in user.roles:
+            if role.name.lower() == req_name:
+                return True
+
     return False
 
 @bot.tree.interaction_check
 async def interaction_check(interaction: discord.Interaction) -> bool:
-    return await has_required_role(interaction)
+    allowed = await has_required_role(interaction)
+    if not allowed:
+        req = config.REQUIRED_ROLE_NAME if config.REQUIRED_ROLE_NAME else f"ID: {config.REQUIRED_ROLE_ID}"
+        embed = discord.Embed(
+            title="⛔ Brak uprawnień!",
+            description=f"Ta komenda jest dostępna tylko dla osób z rangą **`{req}`** lub Administratorów.",
+            color=discord.Color.red()
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        return False
+    return True
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        return
-    logger.error(f"Błąd komendy: {error}", exc_info=True)
+# ===== KOMENDY DISCORD =====
 
-# ===== KOMENDY SLASH =====
-
-@bot.tree.command(name="dodaj_konto", description="Dodaj konto InstaLing do bota (dane są prywatne)")
+@bot.tree.command(name="dodaj_konto", description="Dodaj konto InstaLing do bota")
 @app_commands.describe(
     login="Email lub login do InstaLinga",
     haslo="Hasło do konta InstaLing",
-    jezyk="Wybierz język (auto, de, en)"
+    jezyk="Wybierz język nauki (domyślnie: auto)",
+    waznosc="Wybierz czas ważności konta (np. tydzień, miesiąc, na zawsze)"
 )
 @app_commands.choices(jezyk=[
     app_commands.Choice(name="Automatyczny (wykryj sam)", value="auto"),
     app_commands.Choice(name="Niemiecki (DE)", value="de"),
     app_commands.Choice(name="Angielski (EN)", value="en")
 ])
-async def dodaj_konto(interaction: discord.Interaction, login: str, haslo: str, jezyk: app_commands.Choice[str] = None):
-    # Ephemeral = tylko osoba wywołująca komendę widzi odpowiedź (hasło jest bezpieczne!)
+@app_commands.choices(waznosc=[
+    app_commands.Choice(name="Tydzień (7 dni)", value="7d"),
+    app_commands.Choice(name="Miesiąc (30 dni)", value="30d"),
+    app_commands.Choice(name="Na zawsze (bez limitu)", value="forever")
+])
+async def dodaj_konto(
+    interaction: discord.Interaction,
+    login: str,
+    haslo: str,
+    jezyk: app_commands.Choice[str] = None,
+    waznosc: app_commands.Choice[str] = None
+):
     await interaction.response.defer(ephemeral=True)
     
     lang_val = jezyk.value if jezyk else "auto"
+    expires_at = None
+    waznosc_desc = "♾️ Na zawsze"
+
+    if waznosc and waznosc.value == "7d":
+        exp_dt = datetime.now() + timedelta(days=7)
+        expires_at = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+        waznosc_desc = f"📅 7 dni (do `{expires_at[:10]}`)"
+    elif waznosc and waznosc.value == "30d":
+        exp_dt = datetime.now() + timedelta(days=30)
+        expires_at = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+        waznosc_desc = f"📅 30 dni (do `{expires_at[:10]}`)"
 
     database.add_or_update_account(
         discord_user_id=interaction.user.id,
         login=login,
         password=haslo,
         language=lang_val,
-        auto_daily=1
+        auto_daily=1,
+        expires_at=expires_at
     )
 
     embed = discord.Embed(
         title="✅ Konto zapisane pomyślnie!",
-        description=f"Konto `{login}` zostało dodane. Bot będzie wykonywał dla niego sesje automatycznie codziennie rano.",
+        description=f"Konto `{login}` zostało dodane do bota. Będzie rozwiązywać się codziennie rano.",
         color=discord.Color.green()
     )
     embed.add_field(name="🎯 Język", value=f"`{lang_val.upper()}`", inline=True)
+    embed.add_field(name="⏳ Ważność", value=waznosc_desc, inline=True)
     embed.set_footer(text="Możesz teraz uruchomić sesję komendą /sesja")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -171,15 +191,35 @@ async def konta(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=f"📋 Twoje konta InstaLing ({len(accounts)})",
-        description="Wszystkie Twoje konta są aktywne i wykonują się codziennie rano.",
+        description="Lista zarejestrowanych kont i ich status ważności:",
         color=discord.Color.blue()
     )
 
+    now = datetime.now()
     for i, acc in enumerate(accounts, start=1):
         last_str = acc["last_run"] or "Brak danych"
+        expires_at = acc.get("expires_at")
+
+        if expires_at and str(expires_at).lower() not in ("none", "null", ""):
+            try:
+                exp_dt = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                if now > exp_dt:
+                    exp_str = f"❌ **WYGASŁO** (dnia `{expires_at[:10]}`)"
+                else:
+                    days_left = (exp_dt - now).days
+                    if days_left >= 1:
+                        exp_str = f"⏳ Ważne do: `{expires_at[:10]}` (pozostało: **{days_left} dni**)"
+                    else:
+                        hours_left = max(0, int((exp_dt - now).total_seconds() // 3600))
+                        exp_str = f"⏳ Ważne do: `{expires_at[:16]}` (pozostało: **{hours_left} godz.**)"
+            except Exception:
+                exp_str = f"⏳ Ważne do: `{expires_at[:10]}`"
+        else:
+            exp_str = "♾️ Ważność: **Na zawsze**"
+
         embed.add_field(
             name=f"{i}. Login: `{acc['login']}`",
-            value=f"🎯 Język: `{acc['language'].upper()}`\n🕒 Ostatnia sesja: `{last_str}`",
+            value=f"🎯 Język: `{acc['language'].upper()}`\n{exp_str}\n🕒 Ostatnia sesja: `{last_str}`",
             inline=False
         )
 
@@ -226,10 +266,28 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
     else:
         targets = accounts
 
+    # Weryfikacja ważności czasowej kont
+    active_targets = []
+    expired_logins = []
+    for a in targets:
+        if database.is_account_active(a):
+            active_targets.append(a)
+        else:
+            expired_logins.append(a["login"])
+
+    if not active_targets:
+        exp_list = ", ".join([f"`{l}`" for l in expired_logins])
+        await interaction.followup.send(
+            f"❌ Wskazane konto/konta ({exp_list}) **wygasły**! Użyj `/dodaj_konto`, aby odnowić ich ważność.",
+            ephemeral=True
+        )
+        return
+
+    targets = active_targets
     total = len(targets)
     status_embed = discord.Embed(
         title="⏳ Rozwiązywanie sesji InstaLing...",
-        description=f"Rozpoczynam sesje dla **{total}** kont...",
+        description=f"Rozpoczynam sesje dla **{total}** kont w losowych paczkach...",
         color=discord.Color.gold()
     )
     msg = await interaction.followup.send(embed=status_embed)
@@ -241,7 +299,6 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
 
     while remaining:
         # Losowa wielkość paczki od config.BATCH_SIZE_MIN do config.BATCH_SIZE_MAX (np. 2 do 5)
-        # Jeśli zostało mniej kont, bierzemy wszystkie pozostałe
         batch_size = random.randint(config.BATCH_SIZE_MIN, config.BATCH_SIZE_MAX)
         cur_batch = remaining[:batch_size]
         remaining = remaining[batch_size:]
@@ -259,7 +316,6 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
             pass
 
         async def run_single_in_batch(acc, idx_in_batch):
-            # Delikatne rozstrzelenie startu
             await asyncio.sleep(idx_in_batch * random.uniform(1.5, 4.0))
             r = await solver.solve_session(
                 login=acc["login"],
@@ -306,6 +362,13 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
             val = f"❌ {res['message']}"
         summary_embed.add_field(name=f"👤 `{acc_login}` [{lang_tag}]", value=val, inline=False)
 
+    if expired_logins:
+        summary_embed.add_field(
+            name="⚠️ Pominięte konta (wygasłe)",
+            value=", ".join([f"`{l}`" for l in expired_logins]),
+            inline=False
+        )
+
     summary_embed.set_footer(text="InstaLing AutoBot • dc.zinzelekk")
     await msg.edit(embed=summary_embed)
 
@@ -318,24 +381,27 @@ async def baza(interaction: discord.Interaction):
     en_count = len(firebase_client.cache.get("en", {}))
 
     embed = discord.Embed(
-        title="☁️ Globalna Baza Słówek InstaLing (Firebase)",
+        title="☁️ Baza Słówek Firebase (Wspólna ze skryptem)",
         color=discord.Color.purple()
     )
     embed.add_field(name="🇩🇪 Język Niemiecki (DE)", value=f"**{de_count}** słówek", inline=True)
     embed.add_field(name="🇬🇧 Język Angielski (EN)", value=f"**{en_count}** słówek", inline=True)
-    embed.add_field(name="📈 Łącznie", value=f"**{de_count + en_count}** słówek", inline=True)
-    embed.set_footer(text="Baza synchronizowana na bieżąco z userscriptem i botem")
+    embed.add_field(name="📊 Łącznie w chmurze", value=f"**{de_count + en_count}** słówek", inline=False)
+    embed.set_footer(text="Baza aktualizuje się automatycznie w czasie rzeczywistym")
 
     await interaction.followup.send(embed=embed)
 
-
-
-if __name__ == "__main__":
-    if not config.DISCORD_TOKEN or config.DISCORD_TOKEN == "WSTAW_TUTAJ_TOKEN_BOTA_DISCORD":
-        print("="*60)
+def run():
+    token = config.DISCORD_TOKEN
+    if not token or token == "WSTAW_TUTAJ_TOKEN_BOTA_DISCORD":
+        print("=" * 60)
         print("❌ BŁĄD: Nie ustawiono tokena bota Discord!")
         print("Wklej swój token w pliku .env lub config.py w zmiennej DISCORD_TOKEN.")
         print("Token zdobędziesz na: https://discord.com/developers/applications")
-        print("="*60)
-    else:
-        bot.run(config.DISCORD_TOKEN)
+        print("=" * 60)
+        return
+
+    bot.run(token)
+
+if __name__ == "__main__":
+    run()
