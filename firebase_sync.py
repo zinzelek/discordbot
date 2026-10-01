@@ -3,7 +3,7 @@ import logging
 import re
 import time
 import aiohttp
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 
 import config
 
@@ -194,4 +194,78 @@ class FirebaseClient:
                             logger.error(f"Błąd zapisu do Firebase: status {res.status}")
             except Exception as e:
                 logger.error(f"Wyjątek podczas zapisu do Firebase: {e}")
+        return False
+
+    async def create_license(self, license_type: str = "WEEK", creator: str = "discord-bot") -> Optional[str]:
+        """Generuje nowy klucz licencyjny do skryptu i zapisuje go w Firebase"""
+        import random
+        import string
+
+        license_type = license_type.upper().strip()
+        if license_type not in ("WEEK", "MONTH", "LIFETIME", "DAY"):
+            license_type = "WEEK"
+
+        chars = string.ascii_uppercase + string.digits
+        token = await self.get_token()
+
+        for _ in range(10):
+            part1 = ''.join(random.choices(chars, k=4))
+            part2 = ''.join(random.choices(chars, k=4))
+            key = f"VIP-{part1}-{part2}"
+
+            now_ms = int(time.time() * 1000)
+            td = {"DAY": 86400000, "WEEK": 604800000, "MONTH": 2592000000, "LIFETIME": -1}
+            duration = td.get(license_type, 604800000)
+            expires_at = -1 if duration == -1 else (now_ms + duration)
+
+            data = {
+                "createdAt": now_ms,
+                "createdBy": creator,
+                "expiresAt": expires_at,
+                "status": "unused",
+                "type": license_type
+            }
+
+            url = f"{self.db_url}/licenses/{key}.json"
+            if token:
+                url += f"?auth={token}"
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.put(url, json=data, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                        if res.status in (200, 204):
+                            logger.info(f"🔑 Wygenerowano klucz licencyjny do skryptu: {key} ({license_type})")
+                            return key
+            except Exception as e:
+                logger.error(f"Wyjątek podczas tworzenia licencji: {e}")
+        return None
+
+    async def get_all_licenses(self) -> Dict[str, Any]:
+        """Pobiera wszystkie klucze licencyjne skryptu z Firebase"""
+        token = await self.get_token()
+        url = f"{self.db_url}/licenses.json"
+        if token:
+            url += f"?auth={token}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                    if res.status == 200:
+                        return await res.json() or {}
+        except Exception as e:
+            logger.error(f"Błąd pobierania licencji z Firebase: {e}")
+        return {}
+
+    async def delete_license(self, key: str) -> bool:
+        """Usuwa klucz licencyjny skryptu z Firebase"""
+        key = key.strip().upper()
+        token = await self.get_token()
+        url = f"{self.db_url}/licenses/{key}.json"
+        if token:
+            url += f"?auth={token}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                    return res.status in (200, 204)
+        except Exception as e:
+            logger.error(f"Błąd usuwania licencji {key}: {e}")
         return False
