@@ -108,7 +108,7 @@ class InstaLingSolver:
 
             page = await context.new_page()
 
-            # Blokuj zbędne pliki audio (.mp3) oraz skrypty reklamowe
+            # Blokuj zbędne pliki audio (.mp3) i skrypty reklamowe
             await page.route("**/*.mp3", lambda route: route.abort())
             await page.route("**/*fundingchoices*", lambda route: route.abort())
 
@@ -167,8 +167,48 @@ class InstaLingSolver:
             try:
                 # 1. Logowanie na InstaLing
                 logger.info(f"🔑 Logowanie na konto: {login}...")
-                await page.goto("https://instaling.pl/teacher.php?page=login", wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(1.0)
+                for _goto_attempt in range(3):
+                    try:
+                        await page.goto("https://instaling.pl/teacher.php?page=login", wait_until="domcontentloaded", timeout=45000)
+                        break
+                    except Exception as goto_err:
+                        if _goto_attempt < 2:
+                            logger.warning(f"⚠️ Timeout ładowania strony (próba {_goto_attempt + 1}/3): {goto_err}")
+                            await asyncio.sleep(3)
+                        else:
+                            raise goto_err
+                await asyncio.sleep(1.5)
+
+                # Zamknij cookie consent popup (fc-consent-root) — blokuje interakcje z formularzem
+                for _ in range(5):
+                    removed = await page.evaluate("""() => {
+                        let removed = 0;
+                        // Kliknij przycisk "Consent" / "Zgadzam się" jeśli istnieje
+                        const consentBtns = document.querySelectorAll(
+                            '.fc-cta-consent, .fc-primary-button, button[aria-label="Consent"], ' +
+                            '.fc-button-background, .fc-button[data-testid="consent"], ' +
+                            'button.fc-cta-consent, .fc-dialog .fc-footer .fc-button'
+                        );
+                        for (const btn of consentBtns) {
+                            if (btn.offsetParent !== null) { btn.click(); removed++; }
+                        }
+                        // Usuń cały overlay consent
+                        const overlays = document.querySelectorAll(
+                            '.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ' +
+                            '#credential_picker_container, div[class*="consent"], div[class*="overlay"]'
+                        );
+                        for (const el of overlays) { el.remove(); removed++; }
+                        // Odblokuj body
+                        if (document.body) {
+                            document.body.style.overflow = 'auto';
+                            document.body.style.pointerEvents = 'auto';
+                        }
+                        return removed;
+                    }""")
+                    if removed == 0:
+                        break
+                    logger.info(f"🧹 Usunięto {removed} elementów consent popup")
+                    await asyncio.sleep(0.3)
 
                 await page.fill("#log_email", login)
                 await asyncio.sleep(random.uniform(0.2, 0.4))
@@ -276,6 +316,8 @@ class InstaLingSolver:
                 iterations = 0
                 last_processed_word = ""
                 word_repeat_count: Dict[str, int] = {}
+                last_progress_iter = 0  # ostatnia iteracja, w której coś się wydarzyło
+                stall_logged = False
 
                 while iterations < max_iterations:
                     iterations += 1
@@ -293,6 +335,8 @@ class InstaLingSolver:
                             if (c) c.click();
                         }""")
                         await asyncio.sleep(1.5)
+                        last_progress_iter = iterations
+                        stall_logged = False
                         continue
 
                     # B. Zamknij ewentualne modale
@@ -312,7 +356,60 @@ class InstaLingSolver:
                         result["message"] = "✅ Sesja wykonana pomyślnie!"
                         break
 
-                    # D. Obsługa ekranu poprawki / błędu (#comment_page / #comment_answers)
+                    # D. Obsługa ekranu wyniku (#answer_page) — "Dobrze!" lub "Źle!"
+                    answer_page_loc = page.locator("#answer_page:visible")
+                    if await answer_page_loc.count() > 0:
+                        # Spróbuj odczytać poprawną odpowiedź z answer_page (w przypadku błędu)
+                        dom_captured = await page.evaluate(r"""() => {
+                            const ap = document.getElementById('answer_page');
+                            if (!ap || ap.offsetParent === null) return null;
+                            // Sprawdź #comment_word (pojawia się przy złej odpowiedzi)
+                            const cw = ap.querySelector('#comment_word') || document.getElementById('comment_word');
+                            if (cw && cw.offsetParent !== null) {
+                                const val = (cw.innerText || cw.textContent || '').trim();
+                                if (val && val.length > 0 && val.length < 120) return {word: val, wrong: true};
+                            }
+                            // Sprawdź regex w tekście
+                            const text = (ap.innerText || ap.textContent || '').trim();
+                            const match = text.match(/(?:poprawna odpowiedź|richtige antwort|correct answer)\s*[:：]\s*([^\n\r<]+)/i);
+                            if (match && match[1]) return {word: match[1].trim(), wrong: true};
+                            // Sprawdź wynik
+                            const result = ap.querySelector('#answer_result');
+                            if (result) {
+                                const rt = (result.innerText || '').trim().toLowerCase();
+                                if (rt.includes('dobrze') || rt.includes('richtig') || rt.includes('correct')) {
+                                    return {word: null, wrong: false};
+                                }
+                            }
+                            return {word: null, wrong: false};
+                        }""")
+                        if dom_captured and dom_captured.get("wrong") and dom_captured.get("word") and last_processed_word:
+                            clean_cw = dom_captured["word"].strip()
+                            if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
+                                main_k = last_processed_word.split(";")[0].split(",")[0].strip().lower()
+                                self.firebase.cache.get(current_detected_lang, {})[main_k] = clean_cw
+                                await self.firebase.save_word(main_k, clean_cw, current_detected_lang)
+                                result["learned_words"] += 1
+                                logger.info(f"💾 Odczytano z answer_page i zapisano: '{main_k}' = '{clean_cw}'")
+
+                        # Kliknij "Następne" na answer_page
+                        nxt_btn = page.locator("#answer_page:visible #next_word, #answer_page:visible #nextword, #next_word:visible, #nextword:visible")
+                        if await nxt_btn.count() > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                            try:
+                                await nxt_btn.first.click()
+                            except Exception:
+                                pass
+                        await page.evaluate("""() => {
+                            const n = document.getElementById('next_word') || document.getElementById('nextword');
+                            if (n && n.offsetParent !== null) n.click();
+                        }""")
+                        await asyncio.sleep(0.8)
+                        last_progress_iter = iterations
+                        stall_logged = False
+                        continue
+
+                    # E. Obsługa ekranu poprawki / błędu (#comment_page / #comment_answers)
                     comment_loc = page.locator("#comment_page:visible, #comment_answers:visible")
                     if await comment_loc.count() > 0:
                         dom_captured = await page.evaluate(r"""() => {
@@ -336,7 +433,7 @@ class InstaLingSolver:
                                 logger.info(f"💾 Odczytano z ekranu błędu i zapisano: '{main_k}' = '{clean_cw}'")
 
                         # Kliknij przycisk powrotu lub Enter
-                        cb_btn = page.locator("#comment_back_button:visible, #comment_page:visible #next_word, #comment_page:visible .btn, .btn:has-text('Powrót'):visible, .btn:has-text('Dalej'):visible")
+                        cb_btn = page.locator("#comment_back_button:visible, #comment_page:visible #next_word, #comment_page:visible .btn, .btn:has-text('Powrót'):visible, .btn:has-text('Dalej'):visible, .btn:has-text('Zurück'):visible, .btn:has-text('Weiter'):visible")
                         if await cb_btn.count() > 0:
                             try:
                                 await cb_btn.first.click()
@@ -345,9 +442,11 @@ class InstaLingSolver:
                         else:
                             await page.keyboard.press("Enter")
                         await asyncio.sleep(1.0)
+                        last_progress_iter = iterations
+                        stall_logged = False
                         continue
 
-                    # E. Obsługa przycisku "Pomiń" (#skip_word / #skip)
+                    # F. Obsługa przycisku "Pomiń" (#skip_word / #skip)
                     skip_loc = page.locator("#skip_word:visible, #skip:visible, #possible_word_page:visible #skip, .btn:has-text('Pomiń'):visible, .btn:has-text('Überspringen'):visible, .btn:has-text('Skip'):visible")
                     if await skip_loc.count() > 0:
                         logger.info("⏭️ Wykryto 'Pomiń'. Czekam chwilę...")
@@ -361,9 +460,11 @@ class InstaLingSolver:
                             if (s && s.offsetParent !== null) s.click();
                         }""")
                         await asyncio.sleep(0.8)
+                        last_progress_iter = iterations
+                        stall_logged = False
                         continue
 
-                    # F. Obsługa nowego słówka - "Znam" (#know_new / #know_word)
+                    # G. Obsługa nowego słówka - "Znam" (#know_new / #know_word)
                     know_loc = page.locator("#know_new:visible, #know_word:visible, #new_word_form:visible #know_new, .btn:has-text('Znam'):visible, .btn:has-text('Ich weiß'):visible, .btn:has-text('I know'):visible")
                     if await know_loc.count() > 0:
                         logger.info("🧠 Nowe słówko -> klikam 'ZNAM'...")
@@ -384,9 +485,11 @@ class InstaLingSolver:
                             except Exception:
                                 pass
                             await asyncio.sleep(0.5)
+                        last_progress_iter = iterations
+                        stall_logged = False
                         continue
 
-                    # G. Obsługa przycisku "Następne" / "Weiter"
+                    # H. Obsługa przycisku "Następne" / "Weiter"
                     next_loc = page.locator("#next_word:visible, #nextword:visible, #nextword:visible .btn, .btn:has-text('Następne'):visible, .btn:has-text('Weiter'):visible, .btn:has-text('Next'):visible")
                     if await next_loc.count() > 0:
                         logger.info("➡️ Klikam 'Następne'...")
@@ -400,9 +503,11 @@ class InstaLingSolver:
                             if (n && n.offsetParent !== null) n.click();
                         }""")
                         await asyncio.sleep(0.8)
+                        last_progress_iter = iterations
+                        stall_logged = False
                         continue
 
-                    # H. Standardowe pytanie słówka (#learning_page)
+                    # I. Standardowe pytanie słówka (#learning_page)
                     ans_loc = page.locator("#learning_page:visible #answer, #answer:visible")
                     chk_loc = page.locator("#learning_page:visible #check, #check:visible, #check:visible .btn, .btn:has-text('Sprawdź'):visible, .btn:has-text('Prüfen'):visible, .btn:has-text('Check'):visible")
                     trans_loc = page.locator("#question:visible .translations, #question:visible .translation, #learning_page:visible .translation, .translation:visible")
@@ -416,7 +521,13 @@ class InstaLingSolver:
                             norm_pl = polish_word.lower().strip()
 
                             # Sprawdź czy to nowe pytanie czy jeszcze trwa poprzednie
-                            if norm_pl != last_processed_word:
+                            is_new_question = (norm_pl != last_processed_word)
+                            if not is_new_question:
+                                ans_val = await page.evaluate("() => { const a = document.getElementById('answer'); return a ? a.value : null; }")
+                                if ans_val == "":
+                                    is_new_question = True
+
+                            if is_new_question:
                                 last_processed_word = norm_pl
                                 word_repeat_count[norm_pl] = word_repeat_count.get(norm_pl, 0) + 1
                                 logger.info(f"🇵🇱 Pytanie: '{polish_word}' (wystąpienie: {word_repeat_count[norm_pl]})")
@@ -498,8 +609,12 @@ class InstaLingSolver:
                                     view_sec = random.uniform(2.0, 3.5)
                                 await asyncio.sleep(view_sec)
 
-                                # Kliknij Następne lub Enter
-                                nxt = page.locator("#next_word:visible, #nextword:visible, #nextword:visible .btn, #comment_back_button:visible")
+                                # Kliknij Następne lub Enter — czekaj aż pojawi się przycisk
+                                nxt = page.locator("#next_word:visible, #nextword:visible, #comment_back_button:visible")
+                                for _wait in range(15):
+                                    if await nxt.count() > 0:
+                                        break
+                                    await asyncio.sleep(0.3)
                                 if await nxt.count() > 0:
                                     try:
                                         await nxt.first.click()
@@ -510,7 +625,55 @@ class InstaLingSolver:
                                     if (n && n.offsetParent !== null) n.click();
                                 }""")
                                 await asyncio.sleep(0.6)
+                                last_progress_iter = iterations
+                                stall_logged = False
                                 continue
+
+                    # ===== STALL DETECTION =====
+                    # Jeśli żaden handler nie dopasował (brak 'continue'), wykryj stall
+                    if iterations - last_progress_iter > 30:
+                        if not stall_logged:
+                            stall_logged = True
+                            # Diagnostyka: co jest widoczne na stronie?
+                            try:
+                                diag = await page.evaluate("""() => {
+                                    return Array.from(document.querySelectorAll('*'))
+                                        .filter(el => {
+                                            const s = window.getComputedStyle(el);
+                                            return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetHeight > 0;
+                                        })
+                                        .map(el => ({id: el.id, tag: el.tagName, text: (el.innerText || '').trim().slice(0, 60)}))
+                                        .filter(x => x.id && x.text);
+                                }""")
+                                logger.warning(f"🛑 STALL DETECTED! {iterations - last_progress_iter} iteracji bez postępu. Widoczne elementy: {diag}")
+                            except Exception:
+                                logger.warning(f"🛑 STALL DETECTED! {iterations - last_progress_iter} iteracji bez postępu (nie udało się pobrać diagnostyki)")
+
+                        # Awaryjne kliknięcie dowolnego przycisku / Enter
+                        try:
+                            emergency = await page.evaluate("""() => {
+                                // Zamknij consent overlay
+                                document.querySelectorAll('.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container').forEach(el => el.remove());
+                                if (document.body) { document.body.style.overflow = 'auto'; document.body.style.pointerEvents = 'auto'; }
+                                // Kliknij dowolny widoczny przycisk z sensownym tekstem
+                                const btns = document.querySelectorAll('#next_word, #nextword, #check, #continue_session_button, #start_session_button, #comment_back_button, #know_new, #know_word, #skip_word, #skip');
+                                for (const b of btns) {
+                                    if (b && b.offsetParent !== null) { b.click(); return 'clicked:' + b.id; }
+                                }
+                                return 'nothing';
+                            }""")
+                            if emergency != 'nothing':
+                                logger.info(f"🔧 Awaryjne kliknięcie: {emergency}")
+                                last_progress_iter = iterations
+                                stall_logged = False
+                        except Exception:
+                            pass
+                        await page.keyboard.press("Enter")
+
+                    if iterations - last_progress_iter > 60:
+                        logger.error("🛑 Bot utknął na >60 iteracji bez postępu. Przerywam sesję.")
+                        result["message"] = "❌ Bot utknął — sesja przerwana (brak postępu)"
+                        break
 
                     await asyncio.sleep(0.5)
 
