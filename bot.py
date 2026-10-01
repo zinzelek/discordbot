@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import random
+import time
 from datetime import datetime, timedelta
 import discord
 from discord import app_commands
@@ -390,6 +391,136 @@ async def baza(interaction: discord.Interaction):
     embed.set_footer(text="Baza aktualizuje się automatycznie w czasie rzeczywistym")
 
     await interaction.followup.send(embed=embed)
+
+# ===== ZARZĄDZANIE KLUCZAMI LICENCYJNYMI DO SKRYPTU =====
+
+@bot.tree.command(name="generuj_klucz", description="Wygeneruj klucz VIP do skryptu InstaLing (tydzień, miesiąc, na zawsze)")
+@app_commands.describe(
+    czas="Czas trwania licencji skryptu",
+    ilosc="Liczba kluczy do wygenerowania (1 - 10)"
+)
+@app_commands.choices(czas=[
+    app_commands.Choice(name="Tydzień (7 dni)", value="WEEK"),
+    app_commands.Choice(name="Miesiąc (30 dni)", value="MONTH"),
+    app_commands.Choice(name="Na zawsze (LIFETIME)", value="LIFETIME"),
+    app_commands.Choice(name="Dzień (24 godziny)", value="DAY")
+])
+async def generuj_klucz(
+    interaction: discord.Interaction,
+    czas: app_commands.Choice[str],
+    ilosc: app_commands.Range[int, 1, 10] = 1
+):
+    await interaction.response.defer(ephemeral=True)
+
+    generated_keys = []
+    creator_tag = f"{interaction.user.name} ({interaction.user.id})"
+    for _ in range(ilosc):
+        k = await firebase_client.create_license(license_type=czas.value, creator=creator_tag)
+        if k:
+            generated_keys.append(k)
+
+    if not generated_keys:
+        await interaction.followup.send("❌ Wystąpił błąd podczas generowania kluczy w Firebase.", ephemeral=True)
+        return
+
+    czas_labels = {
+        "WEEK": "📅 Tydzień (7 dni od aktywacji)",
+        "MONTH": "📅 Miesiąc (30 dni od aktywacji)",
+        "LIFETIME": "👑 Na zawsze (LIFETIME)",
+        "DAY": "⏱️ Dzień (24h od aktywacji)"
+    }
+    label = czas_labels.get(czas.value, czas.value)
+
+    keys_formatted = "\n".join([f"`{k}`" for k in generated_keys])
+    embed = discord.Embed(
+        title=f"🔑 Wygenerowano Klucz VIP do Skryptu ({len(generated_keys)})",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="⏳ Typ ważności", value=label, inline=False)
+    embed.add_field(name="🎟️ Klucze (kliknij aby skopiować)", value=keys_formatted, inline=False)
+    embed.add_field(
+        name="📌 Jak aktywować w skrypcie",
+        value=(
+            "1. Zainstaluj i otwórz skrypt Tampermonkey na [instaling.pl](https://instaling.pl).\n"
+            "2. Wklej wygenerowany klucz w okienku licencji.\n"
+            "3. Klucz przypisze się do Twojej przeglądarki (1 klucz = 1 urządzenie).\n"
+            "*(W panelu bocznym skryptu można sprawdzić status lub zmienić klucz).*"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="InstaLing VIP System • dc.zinzelekk")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="klucze_skryptu", description="Wyświetl listę kluczy licencyjnych do skryptu w Firebase")
+async def klucze_skryptu(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    licenses = await firebase_client.get_all_licenses()
+    if not licenses:
+        await interaction.followup.send("ℹ️ W bazie Firebase nie ma obecnie żadnych kluczy licencyjnych skryptu.", ephemeral=True)
+        return
+
+    unused = []
+    bound = []
+
+    now_ms = int(time.time() * 1000)
+
+    for k, v in licenses.items():
+        if not isinstance(v, dict):
+            continue
+        status = v.get("status", "unused")
+        lic_type = v.get("type", "WEEK")
+        exp_ms = v.get("expiresAt", -1)
+
+        if status == "unused":
+            unused.append((k, lic_type))
+        else:
+            if exp_ms == -1:
+                exp_desc = "♾️ Lifetime"
+            elif exp_ms < now_ms:
+                exp_desc = "❌ Wygasł"
+            else:
+                days_left = max(0, int((exp_ms - now_ms) / (1000 * 3600 * 24)))
+                exp_desc = f"⏳ {days_left}d"
+            bound.append((k, lic_type, exp_desc))
+
+    embed = discord.Embed(
+        title=f"🔐 Baza Kluczy Licencyjnych Skryptu ({len(licenses)})",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="📊 Statystyki", value=f"🟢 Niewykorzystane: **{len(unused)}** | 🔒 Aktywne: **{len(bound)}**", inline=False)
+
+    if unused:
+        preview_unused = unused[:15]
+        u_lines = [f"`{k}` — **{t}**" for k, t in preview_unused]
+        if len(unused) > 15:
+            u_lines.append(f"... i jeszcze {len(unused) - 15} wolnych")
+        embed.add_field(name=f"🟢 Wolne klucze ({len(unused)})", value="\n".join(u_lines), inline=False)
+
+    if bound:
+        preview_bound = bound[:15]
+        b_lines = [f"`{k}` — **{t}** ({exp})" for k, t, exp in preview_bound]
+        if len(bound) > 15:
+            b_lines.append(f"... i jeszcze {len(bound) - 15} aktywnych")
+        embed.add_field(name=f"🔒 Aktywne klucze ({len(bound)})", value="\n".join(b_lines), inline=False)
+
+    embed.set_footer(text="InstaLing VIP System • dc.zinzelekk")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="usun_klucz", description="Usuń klucz licencyjny do skryptu z bazy Firebase")
+@app_commands.describe(klucz="Klucz do usunięcia (np. VIP-ABCD-1234)")
+async def usun_klucz(interaction: discord.Interaction, klucz: str):
+    await interaction.response.defer(ephemeral=True)
+
+    clean_key = klucz.strip().upper()
+    success = await firebase_client.delete_license(clean_key)
+    if success:
+        await interaction.followup.send(f"✅ Klucz `{clean_key}` został pomyślnie usunięty z bazy Firebase.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ Nie udało się usunąć klucza `{clean_key}` z bazy Firebase.", ephemeral=True)
 
 def run():
     token = config.DISCORD_TOKEN
