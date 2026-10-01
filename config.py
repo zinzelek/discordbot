@@ -20,7 +20,7 @@ FIREBASE_DATABASE_URL = os.getenv(
 HEADLESS = os.getenv("HEADLESS", "True").lower() in ("true", "1", "yes")
 
 # Emulacja człowieka (w milisekundach - spokojne, ludzkie tempo w 100% niewykrywalne)
-TYPING_SPEED_MIN = int(os.getenv("TYPING_SPEED_MIN", "70"))     # 70ms - 150ms na znak
+TYPING_SPEED_MIN = int(os.getenv("TYPING_SPEED_MIN", "100"))    # 100ms - 150ms na znak
 TYPING_SPEED_MAX = int(os.getenv("TYPING_SPEED_MAX", "150"))
 THINKING_DELAY_MIN = int(os.getenv("THINKING_DELAY_MIN", "2000")) # 2.0s - 3.8s na "zastanowienie się" i przeczytanie pytania
 THINKING_DELAY_MAX = int(os.getenv("THINKING_DELAY_MAX", "3800"))
