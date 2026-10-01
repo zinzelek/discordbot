@@ -316,6 +316,7 @@ class InstaLingSolver:
                 iterations = 0
                 last_processed_word = ""
                 word_repeat_count: Dict[str, int] = {}
+                failed_answers_per_word: Dict[str, set] = {}  # norm_pl -> zbiór błędnych odpowiedzi w tej sesji
                 last_progress_iter = 0  # ostatnia iteracja, w której coś się wydarzyło
                 stall_logged = False
 
@@ -386,10 +387,13 @@ class InstaLingSolver:
                         if dom_captured and dom_captured.get("wrong") and dom_captured.get("word") and last_processed_word:
                             clean_cw = dom_captured["word"].strip()
                             if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
-                                main_k = last_processed_word.split(";")[0].split(",")[0].strip().lower()
-                                self.firebase.cache.get(current_detected_lang, {})[main_k] = clean_cw
-                                await self.firebase.save_word(main_k, clean_cw, current_detected_lang)
-                                result["learned_words"] += 1
+                                parts = [p.strip() for p in re.split(r"[,;]", last_processed_word) if p.strip()]
+                                for part in parts:
+                                    self.firebase.cache.get(current_detected_lang, {})[part] = clean_cw
+                                main_k = parts[0] if parts else last_processed_word
+                                saved = await self.firebase.save_word(main_k, clean_cw, current_detected_lang)
+                                if saved:
+                                    result["learned_words"] += 1
                                 logger.info(f"💾 Odczytano z answer_page i zapisano: '{main_k}' = '{clean_cw}'")
 
                         # Kliknij "Następne" na answer_page
@@ -426,10 +430,13 @@ class InstaLingSolver:
                         if dom_captured and last_processed_word:
                             clean_cw = dom_captured.strip()
                             if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
-                                main_k = last_processed_word.split(";")[0].split(",")[0].strip().lower()
-                                self.firebase.cache.get(current_detected_lang, {})[main_k] = clean_cw
-                                await self.firebase.save_word(main_k, clean_cw, current_detected_lang)
-                                result["learned_words"] += 1
+                                parts = [p.strip() for p in re.split(r"[,;]", last_processed_word) if p.strip()]
+                                for part in parts:
+                                    self.firebase.cache.get(current_detected_lang, {})[part] = clean_cw
+                                main_k = parts[0] if parts else last_processed_word
+                                saved = await self.firebase.save_word(main_k, clean_cw, current_detected_lang)
+                                if saved:
+                                    result["learned_words"] += 1
                                 logger.info(f"💾 Odczytano z ekranu błędu i zapisano: '{main_k}' = '{clean_cw}'")
 
                         # Kliknij przycisk powrotu lub Enter
@@ -541,14 +548,20 @@ class InstaLingSolver:
                                 captured_correct_word = None
 
                                 # ZABEZPIECZENIE ANTY-PĘTLA:
-                                # Jeśli to samo słowo pojawia się już 3. raz w sesji, odpowiedź w bazie jest błędna!
-                                if word_repeat_count[norm_pl] >= 3:
+                                norm_ans = answer.strip().lower() if answer else ""
+                                # 1. Jeśli pobrana odpowiedź już wcześniej zawiodła w tej sesji -> wymuś pobranie nowej
+                                if norm_ans and norm_ans in failed_answers_per_word.get(norm_pl, set()):
+                                    logger.warning(f"⚠️ Odpowiedź '{answer}' dla słowa '{polish_word}' już wcześniej zawiodła! Wymuszam pobranie poprawki.")
+                                    answer = None
+                                # 2. Jeśli dane słowo powtarza się 3. raz lub częściej, a baza ma wciąż tę samą niezmienną odpowiedź:
+                                elif answer and word_repeat_count[norm_pl] >= 3:
                                     logger.warning(f"⚠️ Słowo '{polish_word}' wystąpiło po raz {word_repeat_count[norm_pl]}! Odpowiedź '{answer}' jest błędna. Wymuszam pobranie poprawki!")
-                                    main_k = norm_pl.split(";")[0].split(",")[0].strip()
-                                    self.firebase.cache.get(current_detected_lang, {}).pop(main_k, None)
-                                    self.firebase.cache.get(current_detected_lang, {}).pop(self.firebase.sanitize_key(main_k), None)
+                                    if norm_pl not in failed_answers_per_word:
+                                        failed_answers_per_word[norm_pl] = set()
+                                    failed_answers_per_word[norm_pl].add(norm_ans)
                                     answer = None
 
+                                typed_answer = answer
                                 if answer:
                                     logger.info(f"🎯 Znam z bazy ({current_detected_lang.upper()}): '{answer}'")
                                     await self.human_type(page, "#answer", answer)
@@ -591,14 +604,26 @@ class InstaLingSolver:
 
                                 # Zapisz nowe słowo jeśli przechwyciliśmy
                                 if captured_correct_word:
-                                    main_key = norm_pl.split(";")[0].split(",")[0].strip()
-                                    if not self.firebase.looks_polish(captured_correct_word) and not self.firebase.is_junk(captured_correct_word):
+                                    clean_cw = captured_correct_word.strip()
+                                    if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
+                                        # Jeśli odpowiedź którą wpisaliśmy była inna niż poprawna -> oznacz jako błędną w tej sesji
+                                        if typed_answer and typed_answer.strip().lower() != clean_cw.lower():
+                                            if norm_pl not in failed_answers_per_word:
+                                                failed_answers_per_word[norm_pl] = set()
+                                            failed_answers_per_word[norm_pl].add(typed_answer.strip().lower())
+                                            logger.info(f"❌ Odpowiedź '{typed_answer}' była błędna! Poprawna to: '{clean_cw}'")
+
                                         if current_detected_lang not in self.firebase.cache:
                                             self.firebase.cache[current_detected_lang] = {}
-                                        self.firebase.cache[current_detected_lang][main_key] = captured_correct_word
 
-                                        if not answer or answer.lower() != captured_correct_word.lower():
-                                            saved = await self.firebase.save_word(main_key, captured_correct_word, current_detected_lang)
+                                        # Zapisz dla wszystkich synonimów w pytaniu (np. 'nieporządny; niechlujny, zaniedbany')
+                                        parts = [p.strip() for p in re.split(r"[,;]", norm_pl) if p.strip()]
+                                        for part in parts:
+                                            self.firebase.cache[current_detected_lang][part] = clean_cw
+
+                                        main_key = parts[0] if parts else norm_pl
+                                        if not typed_answer or typed_answer.strip().lower() != clean_cw.lower():
+                                            saved = await self.firebase.save_word(main_key, clean_cw, current_detected_lang)
                                             if saved:
                                                 result["learned_words"] += 1
 
