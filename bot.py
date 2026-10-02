@@ -317,12 +317,20 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
             pass
 
         async def run_single_in_batch(acc, idx_in_batch):
-            await asyncio.sleep(idx_in_batch * random.uniform(1.5, 4.0))
+            await asyncio.sleep(idx_in_batch * random.uniform(8.0, 15.0))
             r = await solver.solve_session(
                 login=acc["login"],
                 password=acc["password"],
                 preferred_lang=acc.get("language", "auto")
             )
+            # Jeśli sesja nie powiodła się z powodu błędu sieci/timeoutu (ale nie błędnego hasła), ponów próbę
+            if not r["success"] and not r.get("already_done") and "niepoprawny login" not in r.get("message", "").lower():
+                await asyncio.sleep(random.uniform(10.0, 16.0))
+                r = await solver.solve_session(
+                    login=acc["login"],
+                    password=acc["password"],
+                    preferred_lang=acc.get("language", "auto")
+                )
             if r["success"]:
                 database.update_last_run(interaction.user.id, acc["login"], discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
             return (acc["login"], r)

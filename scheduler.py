@@ -59,8 +59,8 @@ class SessionScheduler:
             logger.info(f"📦 Paczka #{batch_idx} ({len(current_batch)} kont naraz: {logins_str}). Postęp: {processed_count}/{total_accounts}...")
 
             async def solve_and_notify(acc, index_in_batch):
-                # Delikatne rozstrzelenie startu w sekundach, aby nie obciążać sieci w tej samej milisekundzie
-                await asyncio.sleep(index_in_batch * random.uniform(2.0, 5.0))
+                # Rozstrzelenie startu w sekundach, aby konta nie logowały się w tej samej chwili
+                await asyncio.sleep(index_in_batch * random.uniform(8.0, 15.0))
                 user_id = acc["discord_user_id"]
                 login = acc["login"]
                 password = acc["password"]
@@ -69,6 +69,13 @@ class SessionScheduler:
                 logger.info(f"⚙️ Auto-sesja dla konta: {login} ({lang.upper()})...")
                 try:
                     res = await self.solver.solve_session(login, password, lang)
+
+                    # Jeśli sesja nie powiodła się z powodu timeoutu/błędu sieci (ale nie błędnego hasła), spróbuj raz jeszcze
+                    if not res["success"] and not res.get("already_done") and "niepoprawny login" not in res.get("message", "").lower():
+                        logger.warning(f"⚠️ Pierwsza próba sesji dla {login} nie powiodła się ({res.get('message')}). Ponawiam próbę za 15s...")
+                        await asyncio.sleep(random.uniform(12.0, 18.0))
+                        res = await self.solver.solve_session(login, password, lang)
+
                     database.update_last_run(user_id, login, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
                     # Wyślij powiadomienie na DM do użytkownika
