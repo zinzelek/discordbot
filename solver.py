@@ -424,6 +424,7 @@ class InstaLingSolver:
                 word_repeat_count: Dict[str, int] = {}
                 failed_answers_per_word: Dict[str, set] = {}  # norm_pl -> zbiór błędnych odpowiedzi w tej sesji
                 dots_typed_per_word: Dict[str, int] = {}  # norm_pl -> ile razy wpisano '.' w tej sesji
+                answer_attempts: Dict[str, Dict[str, int]] = {}  # norm_pl -> {norm_ans: count}
                 last_progress_iter = 0  # ostatnia iteracja, w której coś się wydarzyło
                 stall_logged = False
 
@@ -663,7 +664,16 @@ class InstaLingSolver:
 
                                 # 1. Wybierz pierwszego kandydata z bazy, który NIE zawiódł jeszcze w tej sesji
                                 for cand in candidates:
-                                    if cand.strip().lower() not in failed_set:
+                                    cand_norm = cand.strip().lower()
+                                    # Zabezpieczenie: jeśli ten konkretny kandydat był już wpisany 2x i słowo wciąż powraca (>=4 raz) -> serwer go odrzuca!
+                                    if answer_attempts.get(norm_pl, {}).get(cand_norm, 0) >= 2 and word_repeat_count[norm_pl] >= 4:
+                                        if norm_pl not in failed_answers_per_word:
+                                            failed_answers_per_word[norm_pl] = set()
+                                        failed_answers_per_word[norm_pl].add(cand_norm)
+                                        logger.warning(f"⚠️ Odpowiedź '{cand}' dla '{polish_word}' wpisana już 2x i brak zaliczenia ({word_repeat_count[norm_pl]}. wystąpienie)! Oznaczam jako błędną.")
+                                        continue
+
+                                    if cand_norm not in failed_set:
                                         answer = cand
                                         break
 
@@ -681,6 +691,10 @@ class InstaLingSolver:
 
                                 typed_answer = answer
                                 if answer:
+                                    if norm_pl not in answer_attempts:
+                                        answer_attempts[norm_pl] = {}
+                                    norm_typed = answer.strip().lower()
+                                    answer_attempts[norm_pl][norm_typed] = answer_attempts[norm_pl].get(norm_typed, 0) + 1
                                     logger.info(f"🎯 Znam z bazy ({current_detected_lang.upper()}): '{answer}'")
                                     await self.human_type(page, "#answer", answer)
                                     result["correct_words"] += 1
@@ -715,13 +729,73 @@ class InstaLingSolver:
                                     if (c && c.offsetParent !== null) c.click();
                                 }""")
 
-                                # Czekaj na odpowiedź sieciową (XHR)
-                                for _ in range(20):
+                                # Czekaj na odpowiedź sieciową (XHR) lub pojawienie się wyniku w DOM
+                                for _ in range(25):
                                     await asyncio.sleep(0.1)
                                     if captured_correct_word:
                                         break
+                                    # Sprawdź stan DOM (comment_page, comment_word, answer_page, next_word)
+                                    dom_status = await page.evaluate(r"""() => {
+                                        // 1. Sprawdź #comment_word (pojawia się przy błędnej odpowiedzi)
+                                        const cw = document.getElementById('comment_word') ||
+                                                   document.querySelector('#comment_page #word') ||
+                                                   document.querySelector('#comment_answers #word') ||
+                                                   document.querySelector('.comment_word') ||
+                                                   document.querySelector('#answer_page #comment_word');
+                                        if (cw && cw.offsetParent !== null) {
+                                            const val = (cw.innerText || cw.textContent || '').trim();
+                                            if (val && val.length > 0 && val.length < 120) {
+                                                return { ready: true, was_wrong: true, correct_word: val };
+                                            }
+                                        }
 
-                                # Zapisz nowe słowo jeśli przechwyciliśmy
+                                        // 2. Sprawdź czy widoczny jest ekran błędu (#comment_page, #comment_answers, #comment_back_button)
+                                        const cp = document.getElementById('comment_page') || document.getElementById('comment_answers');
+                                        const cbb = document.getElementById('comment_back_button');
+                                        if ((cp && cp.offsetParent !== null) || (cbb && cbb.offsetParent !== null)) {
+                                            const fullText = ((cp ? cp.innerText : '') + ' ' + (document.body ? document.body.innerText : '')).trim();
+                                            const match = fullText.match(/(?:poprawna odpowied[źz]|richtige antwort|correct answer)\s*[:：]\s*([^\n\r<]+)/i);
+                                            return { ready: true, was_wrong: true, correct_word: match ? match[1].trim() : null };
+                                        }
+
+                                        // 3. Sprawdź answer_page i answer_result
+                                        const ap = document.getElementById('answer_page');
+                                        if (ap && ap.offsetParent !== null) {
+                                            const res = ap.querySelector('#answer_result');
+                                            const rt = res ? (res.innerText || '').trim().toLowerCase() : '';
+                                            if (rt.includes('źle') || rt.includes('zle') || rt.includes('falsch') || rt.includes('wrong') || rt.includes('niepoprawna')) {
+                                                const match = ap.innerText.match(/(?:poprawna odpowied[źz]|richtige antwort|correct answer)\s*[:：]\s*([^\n\r<]+)/i);
+                                                return { ready: true, was_wrong: true, correct_word: match ? match[1].trim() : null };
+                                            }
+                                            if (rt.includes('dobrze') || rt.includes('richtig') || rt.includes('correct') || rt.includes('świetnie')) {
+                                                return { ready: true, was_wrong: false, correct_word: null };
+                                            }
+                                        }
+
+                                        // 4. Sprawdź czy pojawił się przycisk "Następne" (#next_word)
+                                        const nw = document.getElementById('next_word') || document.getElementById('nextword');
+                                        if (nw && nw.offsetParent !== null) {
+                                            return { ready: true, was_wrong: false, correct_word: null };
+                                        }
+
+                                        return null;
+                                    }""")
+
+                                    if dom_status and dom_status.get("ready"):
+                                        if dom_status.get("was_wrong"):
+                                            cw = dom_status.get("correct_word")
+                                            if cw and not self.firebase.looks_polish(cw) and not self.firebase.is_junk(cw):
+                                                captured_correct_word = cw
+                                                logger.info(f"🔍 [DOM] Wykryto BŁĄD! Poprawna odpowiedź: '{cw}'")
+                                            else:
+                                                if typed_answer:
+                                                    if norm_pl not in failed_answers_per_word:
+                                                        failed_answers_per_word[norm_pl] = set()
+                                                    failed_answers_per_word[norm_pl].add(typed_answer.strip().lower())
+                                                    logger.warning(f"⚠️ [DOM] Odpowiedź '{typed_answer}' dla '{polish_word}' była BŁĘDNA! (ekran poprawki widoczny)")
+                                        break
+
+                                # Zapisz nowe słowo jeśli przechwyciliśmy (z XHR lub DOM fallback)
                                 if captured_correct_word:
                                     clean_cw = captured_correct_word.strip()
                                     if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
