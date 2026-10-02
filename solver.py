@@ -45,6 +45,55 @@ class InstaLingSolver:
             logger.warning(f"human_type fallback: {e}")
             await page.fill(selector, text)
 
+    async def safe_get_content(self, page: Page, max_retries: int = 6) -> str:
+        """Pobiera zawartość strony bez ryzyka błędu 'Unable to retrieve content because the page is navigating'"""
+        for attempt in range(max_retries):
+            try:
+                return await page.content()
+            except Exception as e:
+                err_str = str(e).lower()
+                if "navigating" in err_str:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=4000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1.0)
+                else:
+                    await asyncio.sleep(0.5)
+        try:
+            return await page.content()
+        except Exception:
+            return ""
+
+    async def dismiss_overlays(self, page: Page):
+        """Usuwa modale, cookie consent i odblokowuje body"""
+        try:
+            await page.evaluate("""() => {
+                const consentBtns = document.querySelectorAll(
+                    '.fc-cta-consent, .fc-primary-button, button[aria-label="Consent"], ' +
+                    '.fc-button-background, .fc-button[data-testid="consent"], ' +
+                    'button.fc-cta-consent, .fc-dialog .fc-footer .fc-button, ' +
+                    'button:has-text("Zgadzam się"), button:has-text("Consent"), button:has-text("Rozumiem")'
+                );
+                for (const b of consentBtns) {
+                    try { if (b.offsetParent !== null) b.click(); } catch(e) {}
+                }
+                const overlays = document.querySelectorAll(
+                    '.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ' +
+                    '#credential_picker_container, iframe[src*="google"], ' +
+                    'iframe[src*="fundingchoices"], div[class*="consent"], div[class*="overlay"]'
+                );
+                for (const o of overlays) {
+                    try { o.remove(); } catch(e) {}
+                }
+                if (document.body) {
+                    document.body.style.overflow = 'auto';
+                    document.body.style.pointerEvents = 'auto';
+                }
+            }""")
+        except Exception:
+            pass
+
     async def solve_session(self, login: str, password: str, preferred_lang: str = "auto") -> Dict[str, Any]:
         """
         Loguje się na konto InstaLing i automatycznie rozwiązuje całą sesję słówek.
@@ -169,71 +218,128 @@ class InstaLingSolver:
                 logger.info(f"🔑 Logowanie na konto: {login}...")
                 for _goto_attempt in range(3):
                     try:
-                        await page.goto("https://instaling.pl/teacher.php?page=login", wait_until="domcontentloaded", timeout=45000)
+                        await page.goto("https://instaling.pl/teacher.php?page=login", wait_until="domcontentloaded", timeout=35000)
                         break
                     except Exception as goto_err:
                         if _goto_attempt < 2:
                             logger.warning(f"⚠️ Timeout ładowania strony (próba {_goto_attempt + 1}/3): {goto_err}")
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(2)
                         else:
                             raise goto_err
-                await asyncio.sleep(1.5)
 
-                # Zamknij cookie consent popup (fc-consent-root) — blokuje interakcje z formularzem
-                for _ in range(5):
-                    removed = await page.evaluate("""() => {
-                        let removed = 0;
-                        // Kliknij przycisk "Consent" / "Zgadzam się" jeśli istnieje
-                        const consentBtns = document.querySelectorAll(
-                            '.fc-cta-consent, .fc-primary-button, button[aria-label="Consent"], ' +
-                            '.fc-button-background, .fc-button[data-testid="consent"], ' +
-                            'button.fc-cta-consent, .fc-dialog .fc-footer .fc-button'
-                        );
-                        for (const btn of consentBtns) {
-                            if (btn.offsetParent !== null) { btn.click(); removed++; }
-                        }
-                        // Usuń cały overlay consent
-                        const overlays = document.querySelectorAll(
-                            '.fc-consent-root, .fc-dialog-overlay, .fc-dialog-container, ' +
-                            '#credential_picker_container, div[class*="consent"], div[class*="overlay"]'
-                        );
-                        for (const el of overlays) { el.remove(); removed++; }
-                        // Odblokuj body
-                        if (document.body) {
-                            document.body.style.overflow = 'auto';
-                            document.body.style.pointerEvents = 'auto';
-                        }
-                        return removed;
-                    }""")
-                    if removed == 0:
+                await asyncio.sleep(1.0)
+                await self.dismiss_overlays(page)
+
+                # Sprawdź czy strona logowania jest załadowana lub czy jesteśmy już zalogowani
+                logged_in_already = False
+                email_found = False
+                for _find_attempt in range(3):
+                    if "student" in page.url.lower() or "app.php" in page.url.lower():
+                        logged_in_already = True
                         break
-                    logger.info(f"🧹 Usunięto {removed} elementów consent popup")
-                    await asyncio.sleep(0.3)
+                    await self.dismiss_overlays(page)
+                    try:
+                        email_el = await page.wait_for_selector(
+                            "#log_email, input[name='log_email'], input[autocomplete='username']",
+                            timeout=7000,
+                            state="attached"
+                        )
+                        if email_el:
+                            email_found = True
+                            break
+                    except Exception:
+                        logger.warning(f"⚠️ Nie znaleziono pola logowania (próba {_find_attempt + 1}/3), odświeżam stronę...")
+                        try:
+                            await page.goto("https://instaling.pl/teacher.php?page=login", wait_until="domcontentloaded", timeout=25000)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.5)
 
-                await page.fill("#log_email", login)
-                await asyncio.sleep(random.uniform(0.2, 0.4))
-                await page.fill("#log_password", password)
-                await asyncio.sleep(random.uniform(0.3, 0.5))
-
-                await page.evaluate("""() => {
-                    const btn = document.querySelector('button[type="submit"]') || document.querySelector('.btn-primary');
-                    if (btn) btn.click();
-                }""")
-
-                try:
-                    await page.wait_for_url("**/student/**", timeout=12000)
-                except Exception:
-                    content = await page.content()
-                    if "Niepoprawny e-mail lub hasło" in content or "Błędny login" in content:
-                        result["message"] = "❌ Niepoprawny login lub hasło do InstaLinga!"
+                if not logged_in_already and not email_found:
+                    if "student" in page.url.lower() or "app.php" in page.url.lower():
+                        logged_in_already = True
+                    else:
+                        result["message"] = f"❌ Nie udało się załadować formularza logowania (URL: {page.url})"
                         await browser.close()
                         return result
+
+                if not logged_in_already:
+                    await self.dismiss_overlays(page)
+                    # Wypełnij login i hasło (bezpiecznie z force=True i evaluate fallback)
+                    try:
+                        await page.fill("#log_email", login, force=True, timeout=5000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(random.uniform(0.15, 0.3))
+
+                    try:
+                        await page.fill("#log_password", password, force=True, timeout=5000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(random.uniform(0.2, 0.4))
+
+                    # Upewnij się, że pola są faktycznie wypełnione i zdarzenia wysłane
+                    await page.evaluate("""([l, p]) => {
+                        const emailInput = document.querySelector('#log_email') || document.querySelector('input[name="log_email"]');
+                        const passInput = document.querySelector('#log_password') || document.querySelector('input[name="log_password"]');
+                        if (emailInput) {
+                            emailInput.value = l;
+                            emailInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            emailInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        if (passInput) {
+                            passInput.value = p;
+                            passInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            passInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                    }""", [login, password])
+
+                    # Kliknij Zaloguj
+                    await page.evaluate("""() => {
+                        const btn = document.querySelector('button[type="submit"]') || document.querySelector('.btn-primary');
+                        if (btn) btn.click();
+                    }""")
+
+                    # Czekaj na przejście do panelu studenta lub błąd logowania (do 25s)
+                    login_ok = False
+                    for _wait in range(25):
+                        cur_url = page.url.lower()
+                        if "student" in cur_url or "app.php" in cur_url:
+                            login_ok = True
+                            break
+
+                        # Sprawdź widoczne komunikaty błędów
+                        try:
+                            err_el = await page.query_selector(".alert-danger, #login_error, .error, #log_email_error")
+                            if err_el and await err_el.is_visible():
+                                err_txt = await err_el.inner_text()
+                                if any(w in err_txt.lower() for w in ["niepoprawny", "błędny", "hasło", "login"]):
+                                    result["message"] = f"❌ Niepoprawny login lub hasło do InstaLinga ({err_txt.strip()})"
+                                    await browser.close()
+                                    return result
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(1.0)
+
+                    if not login_ok:
+                        content = await self.safe_get_content(page)
+                        if "Niepoprawny e-mail lub hasło" in content or "Błędny login" in content:
+                            result["message"] = "❌ Niepoprawny login lub hasło do InstaLinga!"
+                            await browser.close()
+                            return result
+                        elif "student" in page.url.lower():
+                            login_ok = True
+                        else:
+                            result["message"] = f"❌ Logowanie przekroczyło limit czasu (URL: {page.url})"
+                            await browser.close()
+                            return result
 
                 logger.info("✅ Zalogowano pomyślnie.")
                 await asyncio.sleep(1.2)
 
                 # 2. Sprawdzenie stanu sesji
-                content = await page.content()
+                content = await self.safe_get_content(page)
                 session_link = None
                 candidate_links = await page.query_selector_all("a.btn-start-session, a.btn-make-up-session-light, a[href*='app.php']")
                 for cl in candidate_links:
@@ -317,6 +423,7 @@ class InstaLingSolver:
                 last_processed_word = ""
                 word_repeat_count: Dict[str, int] = {}
                 failed_answers_per_word: Dict[str, set] = {}  # norm_pl -> zbiór błędnych odpowiedzi w tej sesji
+                dots_typed_per_word: Dict[str, int] = {}  # norm_pl -> ile razy wpisano '.' w tej sesji
                 last_progress_iter = 0  # ostatnia iteracja, w której coś się wydarzyło
                 stall_logged = False
 
@@ -387,6 +494,8 @@ class InstaLingSolver:
                         if dom_captured and dom_captured.get("wrong") and dom_captured.get("word") and last_processed_word:
                             clean_cw = dom_captured["word"].strip()
                             if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
+                                if last_processed_word in failed_answers_per_word:
+                                    failed_answers_per_word[last_processed_word].discard(clean_cw.lower())
                                 parts = [p.strip() for p in re.split(r"[,;]", last_processed_word) if p.strip()]
                                 for part in parts:
                                     self.firebase.cache.get(current_detected_lang, {})[part] = clean_cw
@@ -430,6 +539,8 @@ class InstaLingSolver:
                         if dom_captured and last_processed_word:
                             clean_cw = dom_captured.strip()
                             if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
+                                if last_processed_word in failed_answers_per_word:
+                                    failed_answers_per_word[last_processed_word].discard(clean_cw.lower())
                                 parts = [p.strip() for p in re.split(r"[,;]", last_processed_word) if p.strip()]
                                 for part in parts:
                                     self.firebase.cache.get(current_detected_lang, {})[part] = clean_cw
@@ -544,22 +655,29 @@ class InstaLingSolver:
                                 logger.info(f"🤔 Zastanawiam się ({think_sec:.1f}s)...")
                                 await asyncio.sleep(think_sec)
 
-                                answer = self.firebase.get_answer(polish_word, current_detected_lang)
+                                candidates = self.firebase.get_all_answers(polish_word, current_detected_lang)
                                 captured_correct_word = None
 
-                                # ZABEZPIECZENIE ANTY-PĘTLA:
-                                norm_ans = answer.strip().lower() if answer else ""
-                                # 1. Jeśli pobrana odpowiedź już wcześniej zawiodła w tej sesji -> wymuś pobranie nowej
-                                if norm_ans and norm_ans in failed_answers_per_word.get(norm_pl, set()):
-                                    logger.warning(f"⚠️ Odpowiedź '{answer}' dla słowa '{polish_word}' już wcześniej zawiodła! Wymuszam pobranie poprawki.")
-                                    answer = None
-                                # 2. Jeśli dane słowo powtarza się 3. raz lub częściej, a baza ma wciąż tę samą niezmienną odpowiedź:
-                                elif answer and word_repeat_count[norm_pl] >= 3:
-                                    logger.warning(f"⚠️ Słowo '{polish_word}' wystąpiło po raz {word_repeat_count[norm_pl]}! Odpowiedź '{answer}' jest błędna. Wymuszam pobranie poprawki!")
-                                    if norm_pl not in failed_answers_per_word:
-                                        failed_answers_per_word[norm_pl] = set()
-                                    failed_answers_per_word[norm_pl].add(norm_ans)
-                                    answer = None
+                                failed_set = failed_answers_per_word.get(norm_pl, set())
+                                answer = None
+
+                                # 1. Wybierz pierwszego kandydata z bazy, który NIE zawiódł jeszcze w tej sesji
+                                for cand in candidates:
+                                    if cand.strip().lower() not in failed_set:
+                                        answer = cand
+                                        break
+
+                                # 2. Jeśli wszystkie znane odpowiedzi zawiodły w tej sesji:
+                                if not answer and candidates:
+                                    # Sprawdź czy kropka była już wpisywana dla tego słowa w tej sesji
+                                    if dots_typed_per_word.get(norm_pl, 0) >= 1:
+                                        # Kropka była już użyta! Resetujemy failed_set, aby uniknąć pętli kropki
+                                        logger.info(f"🔄 Słowo '{polish_word}': resetuję blokadę failed_set (kropka była już użyta). Próbuję: '{candidates[0]}'")
+                                        failed_answers_per_word[norm_pl].clear()
+                                        answer = candidates[0]
+                                    else:
+                                        logger.warning(f"⚠️ Wszystkie znane odpowiedzi dla '{polish_word}' ({candidates}) zawiodły! Pobieram poprawkę.")
+                                        answer = None
 
                                 typed_answer = answer
                                 if answer:
@@ -568,6 +686,7 @@ class InstaLingSolver:
                                     result["correct_words"] += 1
                                 else:
                                     # Nigdy nie zostawiaj pustego pola (InstaLing ignoruje pusty submit)! Wpisujemy kropkę:
+                                    dots_typed_per_word[norm_pl] = dots_typed_per_word.get(norm_pl, 0) + 1
                                     logger.info("❓ Nieznane słowo -> wpisuję '.' aby pobrać poprawną odpowiedź")
                                     await page.click("#answer")
                                     await page.fill("#answer", ".")
@@ -606,12 +725,16 @@ class InstaLingSolver:
                                 if captured_correct_word:
                                     clean_cw = captured_correct_word.strip()
                                     if not self.firebase.looks_polish(clean_cw) and not self.firebase.is_junk(clean_cw):
-                                        # Jeśli odpowiedź którą wpisaliśmy była inna niż poprawna -> oznacz jako błędną w tej sesji
+                                        # Poprawna odpowiedź ZAWSZE jest usuwana z failed_set (serwer potwierdził, że jest dobra!)
+                                        if norm_pl in failed_answers_per_word:
+                                            failed_answers_per_word[norm_pl].discard(clean_cw.lower())
+
+                                        # Jeśli odpowiedź którą wpisaliśmy była inna niż poprawna -> oznacz tę konkretną jako błędną w tej sesji
                                         if typed_answer and typed_answer.strip().lower() != clean_cw.lower():
                                             if norm_pl not in failed_answers_per_word:
                                                 failed_answers_per_word[norm_pl] = set()
                                             failed_answers_per_word[norm_pl].add(typed_answer.strip().lower())
-                                            logger.info(f"❌ Odpowiedź '{typed_answer}' była błędna! Poprawna to: '{clean_cw}'")
+                                            logger.info(f"❌ Odpowiedź '{typed_answer}' była błędna dla tego pytania! Poprawna to: '{clean_cw}'")
 
                                         if current_detected_lang not in self.firebase.cache:
                                             self.firebase.cache[current_detected_lang] = {}

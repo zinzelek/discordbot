@@ -123,35 +123,43 @@ class FirebaseClient:
                 logger.error(f"Wyjątek podczas łączenia z Firebase: {e}")
         return self.cache
 
-    def get_answer(self, polish_text: str, lang: str = "en") -> str | None:
-        """Zwraca odpowiedź z lokalnego cache dla podanego języka"""
+    def get_all_answers(self, polish_text: str, lang: str = "en") -> list[str]:
+        """Zwraca listę wszystkich znanych poprawnych odpowiedzi (w tym synonimów) dla danego słowa"""
         lang = lang.lower().strip()
         dict_data = self.cache.get(lang, {})
         if not dict_data:
-            return None
+            return []
 
         clean_pl = polish_text.strip().lower()
+        candidates: list[str] = []
+        seen = set()
 
-        # Dokładne dopasowanie
-        full_key = clean_pl
-        safe_full_key = self.sanitize_key(full_key)
-        for k in (full_key, safe_full_key):
+        def add_candidate(raw: str, ref_key: str):
+            for part in re.split(r"[,;]", raw):
+                ans = part.strip()
+                norm = ans.lower()
+                if ans and norm not in seen and norm != ref_key and not self.looks_polish(ans) and not self.is_junk(ans):
+                    seen.add(norm)
+                    candidates.append(ans)
+
+        # 1. Dokładne dopasowanie klucza
+        for k in (clean_pl, self.sanitize_key(clean_pl)):
             if k in dict_data:
-                val = dict_data[k].split(";")[0].split(",")[0].strip()
-                if val.lower() != full_key and not self.looks_polish(val) and not self.is_junk(val):
-                    return val
+                add_candidate(dict_data[k], clean_pl)
 
-        # Sprawdź części przed średnikiem lub przecinkiem
+        # 2. Części przed/po separatorach w pytaniu
         parts = [p.strip().lower() for p in re.split(r"[,;]", polish_text) if p.strip()]
         for p in parts:
-            safe_p = self.sanitize_key(p)
-            for k in (p, safe_p):
+            for k in (p, self.sanitize_key(p)):
                 if k in dict_data:
-                    val = dict_data[k].split(";")[0].split(",")[0].strip()
-                    if val.lower() != p and not self.looks_polish(val) and not self.is_junk(val):
-                        return val
+                    add_candidate(dict_data[k], p)
 
-        return None
+        return candidates
+
+    def get_answer(self, polish_text: str, lang: str = "en") -> str | None:
+        """Zwraca pierwszą dostępną poprawną odpowiedź z lokalnego cache dla podanego języka"""
+        candidates = self.get_all_answers(polish_text, lang)
+        return candidates[0] if candidates else None
 
     async def save_word(self, polish_word: str, translation: str, lang: str = "en") -> bool:
         """Zapisuje nowe słówko do bazy Firebase oraz lokalnego cache z auto-retry na 401"""
@@ -163,12 +171,19 @@ class FirebaseClient:
             logger.warning(f"🛑 [SAVE REJECTED] Odrzucono: '{k}' = '{v}'")
             return False
 
+        # Jeśli już mamy zapisane inne synonimy, zachowaj je zamiast bezpowrotnie niszczyć
+        safe_k = self.sanitize_key(k)
+        existing = self.cache.get(lang, {}).get(k) or self.cache.get(lang, {}).get(safe_k)
+        if existing and existing.strip().lower() != v.lower() and not self.looks_polish(existing) and not self.is_junk(existing):
+            existing_parts = [p.strip() for p in re.split(r"[,;]", existing) if p.strip()]
+            all_parts = [v] + [p for p in existing_parts if p.lower() != v.lower() and not self.is_junk(p)]
+            v = "; ".join(all_parts[:3])
+
         # Zaktualizuj pamięć lokalną ZAWSZE
         if lang not in self.cache:
             self.cache[lang] = {}
         self.cache[lang][k] = v
 
-        safe_k = self.sanitize_key(k)
         if safe_k != k:
             self.cache[lang][safe_k] = v
 
