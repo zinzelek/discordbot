@@ -29,11 +29,14 @@ ACTION_DELAY_MAX = int(os.getenv("ACTION_DELAY_MAX", "1600"))
 NEXT_WORD_DELAY_MIN = int(os.getenv("NEXT_WORD_DELAY_MIN", "1400")) # 1.4s - 2.5s na podgląd odpowiedzi
 NEXT_WORD_DELAY_MAX = int(os.getenv("NEXT_WORD_DELAY_MAX", "2500"))
 
-# Losowe paczki kont naraz (np. raz 5, potem 3, potem 2, potem 4)
-BATCH_SIZE_MIN = int(os.getenv("BATCH_SIZE_MIN", "2"))          # min. kont w paczce
-BATCH_SIZE_MAX = int(os.getenv("BATCH_SIZE_MAX", "5"))          # max. kont w paczce
-BATCH_PAUSE_MIN = int(os.getenv("BATCH_PAUSE_MIN", "6"))        # min. sekund przerwy między paczkami
-BATCH_PAUSE_MAX = int(os.getenv("BATCH_PAUSE_MAX", "15"))       # max. sekund przerwy między paczkami
+# Maksymalna liczba jednocześnie otwartych przeglądarek (ochrona przed Target crashed / OOM w Dockerze)
+MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "2"))
+
+# Losowe paczki kont naraz (zalecane 1-2 dla stabilności RAM i uniknięcia crashu)
+BATCH_SIZE_MIN = int(os.getenv("BATCH_SIZE_MIN", "1"))          # min. kont w paczce
+BATCH_SIZE_MAX = int(os.getenv("BATCH_SIZE_MAX", "2"))          # max. kont w paczce
+BATCH_PAUSE_MIN = int(os.getenv("BATCH_PAUSE_MIN", "5"))        # min. sekund przerwy między paczkami
+BATCH_PAUSE_MAX = int(os.getenv("BATCH_PAUSE_MAX", "12"))       # max. sekund przerwy między paczkami
 
 # Domyślna godzina automatycznego wykonywania sesji (np. 7 rano)
 DEFAULT_AUTO_HOUR = int(os.getenv("DEFAULT_AUTO_HOUR", "7"))

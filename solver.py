@@ -15,6 +15,7 @@ class InstaLingSolver:
     def __init__(self, firebase_client: FirebaseClient, headless: bool = True):
         self.firebase = firebase_client
         self.headless = headless
+        self.semaphore = asyncio.Semaphore(getattr(config, "MAX_CONCURRENT_SESSIONS", 2))
 
     async def human_type(self, page: Page, selector: str, text: str):
         """Wpisuje tekst znak po znaku z realistycznymi opóźnieniami człowieka"""
@@ -95,8 +96,13 @@ class InstaLingSolver:
             pass
 
     async def solve_session(self, login: str, password: str, preferred_lang: str = "auto") -> Dict[str, Any]:
+        """Loguje się na konto InstaLing i automatycznie rozwiązuje sesję (limitowana współbieżność przez semafor)"""
+        async with self.semaphore:
+            return await self._solve_session_impl(login, password, preferred_lang)
+
+    async def _solve_session_impl(self, login: str, password: str, preferred_lang: str = "auto") -> Dict[str, Any]:
         """
-        Loguje się na konto InstaLing i automatycznie rozwiązuje całą sesję słówek.
+        Właściwa implementacja rozwiązywania sesji słówek.
         W 100% niewykrywalne, spokojne tempo emulujące prawdziwego ucznia.
         """
         start_time = time.time()
@@ -118,11 +124,20 @@ class InstaLingSolver:
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
                     "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-accelerated-2d-canvas",
                     "--no-first-run",
-                    "--no-zygote",
-                    "--disable-blink-features=AutomationControlled"
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-extensions",
+                    "--disable-component-update",
+                    "--disable-background-networking",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    "--disable-ipc-flooding-protection",
+                    "--js-flags=--max-old-space-size=256",
+                    "--mute-audio"
                 ]
             )
 
@@ -138,7 +153,7 @@ class InstaLingSolver:
                     const selectors = [
                         '.fc-consent-root', '.fc-dialog-overlay', '.fc-dialog-container',
                         '#credential_picker_container', '#google_esf', 'iframe[src*="google"]',
-                        'iframe[src*="fundingchoices"]', 'div[class*="consent"]', 'div[class*="overlay"]'
+                        'iframe[src*="fundingchoices"]', 'div[class*="consent"]'
                     ];
                     for (const s of selectors) {
                         try {
@@ -146,13 +161,9 @@ class InstaLingSolver:
                             els.forEach(el => el.remove());
                         } catch (e) {}
                     }
-                    if (document.body) {
-                        document.body.style.overflow = 'auto';
-                        document.body.style.pointerEvents = 'auto';
-                    }
                 };
                 window.addEventListener('DOMContentLoaded', cleanOverlays);
-                setInterval(cleanOverlays, 300);
+                setInterval(cleanOverlays, 1500);
             """)
 
             page = await context.new_page()
