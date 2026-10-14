@@ -33,6 +33,9 @@ async def on_ready():
     # Inicjalizacja bazy słówek
     await firebase_client.fetch_database()
     
+    # Synchronizacja i przywracanie kont z chmury Firebase (ochrona przed utratą kont przy aktualizacji plików)
+    await database.sync_with_firebase(firebase_client)
+    
     # Usunięcie podwójnych komend (czyścimy kopie z serwera, zostawiamy 1 zestaw globalny)
     try:
         for guild in bot.guilds:
@@ -170,6 +173,11 @@ async def dodaj_konto(
         expires_at=expires_at
     )
 
+    # Zapisz natychmiast w trwałej chmurze Firebase (ochrona przed utratą po aktualizacji plików)
+    saved_acc = database.get_account_by_login(interaction.user.id, login)
+    if saved_acc:
+        asyncio.create_task(firebase_client.save_account_cloud(saved_acc))
+
     embed = discord.Embed(
         title="✅ Konto zapisane pomyślnie!",
         description=f"Konto `{login}` zostało dodane do bota. Będzie rozwiązywać się codziennie rano.",
@@ -233,7 +241,9 @@ async def usun_konto(interaction: discord.Interaction, login: str):
     success = database.delete_account(interaction.user.id, login)
 
     if success:
-        await interaction.followup.send(f"✅ Konto `{login}` zostało usunięte z bota.", ephemeral=True)
+        # Usuń również z chmury Firebase
+        asyncio.create_task(firebase_client.delete_account_cloud(interaction.user.id, login))
+        await interaction.followup.send(f"✅ Konto `{login}` zostało usunięte z bota i chmury.", ephemeral=True)
     else:
         await interaction.followup.send(f"❌ Nie znaleziono konta `{login}` przypisanego do Twojego profilu.", ephemeral=True)
 
@@ -333,6 +343,9 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
                 )
             if r["success"]:
                 database.update_last_run(interaction.user.id, acc["login"], discord.utils.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+                up_acc = database.get_account_by_login(interaction.user.id, acc["login"])
+                if up_acc:
+                    asyncio.create_task(firebase_client.save_account_cloud(up_acc))
             return (acc["login"], r)
 
         batch_tasks = [run_single_in_batch(acc, i) for i, acc in enumerate(cur_batch)]
@@ -529,6 +542,21 @@ async def usun_klucz(interaction: discord.Interaction, klucz: str):
         await interaction.followup.send(f"✅ Klucz `{clean_key}` został pomyślnie usunięty z bazy Firebase.", ephemeral=True)
     else:
         await interaction.followup.send(f"❌ Nie udało się usunąć klucza `{clean_key}` z bazy Firebase.", ephemeral=True)
+
+@bot.tree.command(name="synchronizuj_konta", description="Wymuś synchronizację kont z chmurą Firebase (przywracanie/backup)")
+async def synchronizuj_konta(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    res = await database.sync_with_firebase(firebase_client)
+    embed = discord.Embed(
+        title="☁️ Synchronizacja kont z Firebase",
+        description="Pomyślnie zsynchronizowano bazę kont z chmurą Firebase!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="📥 Przywrócone z chmury", value=f"`{res.get('restored', 0)}`", inline=True)
+    embed.add_field(name="📤 Wysłane do chmury", value=f"`{res.get('uploaded', 0)}`", inline=True)
+    embed.add_field(name="📋 Łącznie w bazie", value=f"`{res.get('total', 0)}`", inline=True)
+    embed.set_footer(text="Twoje konta są teraz w 100% bezpieczne w chmurze.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 def run():
     token = config.DISCORD_TOKEN

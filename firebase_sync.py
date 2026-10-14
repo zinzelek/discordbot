@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+from datetime import datetime
 import aiohttp
 from typing import Optional, Dict, Any
 
@@ -283,4 +284,77 @@ class FirebaseClient:
                     return res.status in (200, 204)
         except Exception as e:
             logger.error(f"Błąd usuwania licencji {key}: {e}")
+        return False
+
+    # ===== SYNCHRONIZACJA KONT UŻYTKOWNIKÓW Z CHMURĄ FIREBASE =====
+
+    async def get_all_accounts_cloud(self) -> Dict[str, Any]:
+        """Pobiera wszystkie zarejestrowane konta użytkowników z chmury Firebase"""
+        token = await self.get_token()
+        url = f"{self.db_url}/accounts.json"
+        if token:
+            url += f"?auth={token}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10.0)) as res:
+                    if res.status == 200:
+                        return await res.json() or {}
+        except Exception as e:
+            logger.error(f"Błąd pobierania kont z chmury Firebase: {e}")
+        return {}
+
+    async def save_account_cloud(self, acc: Dict[str, Any]) -> bool:
+        """Zapisuje konto użytkownika do Firebase Realtime Database (trwała chmura)"""
+        user_id = acc.get("discord_user_id")
+        login = str(acc.get("login", "")).strip()
+        if not user_id or not login:
+            return False
+
+        safe_login = self.sanitize_key(login)
+        acc_key = f"{user_id}_{safe_login}"
+        token = await self.get_token()
+        url = f"{self.db_url}/accounts/{acc_key}.json"
+        if token:
+            url += f"?auth={token}"
+
+        data = {
+            "discord_user_id": int(user_id),
+            "login": login,
+            "password": str(acc.get("password", "")).strip(),
+            "language": str(acc.get("language", "auto")).lower().strip(),
+            "auto_daily": int(acc.get("auto_daily", 1)),
+            "last_run": acc.get("last_run"),
+            "expires_at": acc.get("expires_at"),
+            "created_at": acc.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.put(url, json=data, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                    if res.status in (200, 204):
+                        logger.info(f"☁️ [FIREBASE-ACCOUNT] Zapisano konto w chmurze: {login} (user: {user_id})")
+                        return True
+                    else:
+                        logger.error(f"Błąd zapisu konta {login} do Firebase: status {res.status}")
+        except Exception as e:
+            logger.error(f"Wyjątek podczas zapisu konta {login} do Firebase: {e}")
+        return False
+
+    async def delete_account_cloud(self, discord_user_id: int, login: str) -> bool:
+        """Usuwa konto użytkownika z chmury Firebase"""
+        safe_login = self.sanitize_key(str(login).strip())
+        acc_key = f"{discord_user_id}_{safe_login}"
+        token = await self.get_token()
+        url = f"{self.db_url}/accounts/{acc_key}.json"
+        if token:
+            url += f"?auth={token}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                    if res.status in (200, 204):
+                        logger.info(f"☁️ [FIREBASE-ACCOUNT] Usunięto konto z chmury: {login} (user: {discord_user_id})")
+                        return True
+        except Exception as e:
+            logger.error(f"Błąd usuwania konta {login} z Firebase: {e}")
         return False

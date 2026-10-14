@@ -77,6 +77,9 @@ class SessionScheduler:
                         res = await self.solver.solve_session(login, password, lang)
 
                     database.update_last_run(user_id, login, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    up_acc = database.get_account_by_login(user_id, login)
+                    if up_acc:
+                        asyncio.create_task(self.firebase.save_account_cloud(up_acc))
 
                     # Wyślij powiadomienie na DM do użytkownika
                     try:
