@@ -134,25 +134,25 @@ class FirebaseClient:
         candidates: list[str] = []
         seen = set()
 
-        def add_candidate(raw: str, ref_key: str):
+        def add_candidate(raw: str):
             for part in re.split(r"[,;]", raw):
                 ans = part.strip()
                 norm = ans.lower()
-                if ans and norm not in seen and norm != ref_key and not self.looks_polish(ans) and not self.is_junk(ans):
+                if ans and norm not in seen and not self.looks_polish(ans) and not self.is_junk(ans):
                     seen.add(norm)
                     candidates.append(ans)
 
         # 1. Dokładne dopasowanie klucza
         for k in (clean_pl, self.sanitize_key(clean_pl)):
             if k in dict_data:
-                add_candidate(dict_data[k], clean_pl)
+                add_candidate(dict_data[k])
 
         # 2. Części przed/po separatorach w pytaniu
         parts = [p.strip().lower() for p in re.split(r"[,;]", polish_text) if p.strip()]
         for p in parts:
             for k in (p, self.sanitize_key(p)):
                 if k in dict_data:
-                    add_candidate(dict_data[k], p)
+                    add_candidate(dict_data[k])
 
         return candidates
 
@@ -167,7 +167,7 @@ class FirebaseClient:
         k = polish_word.strip().lower()
         v = translation.strip()
 
-        if not k or not v or self.looks_polish(v) or self.is_junk(v) or v.lower() == k:
+        if not k or not v or self.looks_polish(v) or self.is_junk(v):
             logger.warning(f"🛑 [SAVE REJECTED] Odrzucono: '{k}' = '{v}'")
             return False
 
