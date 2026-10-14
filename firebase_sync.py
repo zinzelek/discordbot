@@ -291,16 +291,24 @@ class FirebaseClient:
     async def get_all_accounts_cloud(self) -> Dict[str, Any]:
         """Pobiera wszystkie zarejestrowane konta użytkowników z chmury Firebase"""
         token = await self.get_token()
-        url = f"{self.db_url}/accounts.json"
-        if token:
-            url += f"?auth={token}"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10.0)) as res:
-                    if res.status == 200:
-                        return await res.json() or {}
-        except Exception as e:
-            logger.error(f"Błąd pobierania kont z chmury Firebase: {e}")
+        # Ścieżka /words/_accounts korzysta z otwartych reguł zapisu/odczytu dla /words
+        for path in ["words/_accounts", "accounts"]:
+            for attempt in range(2):
+                url = f"{self.db_url}/{path}.json"
+                if token:
+                    url += f"?auth={token}"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                            if res.status == 200:
+                                data = await res.json()
+                                if data and isinstance(data, dict):
+                                    return data
+                            elif res.status == 401 and attempt == 0:
+                                token = await self.get_token(force_refresh=True)
+                                continue
+                except Exception as e:
+                    logger.debug(f"Błąd pobierania kont z {path}: {e}")
         return {}
 
     async def save_account_cloud(self, acc: Dict[str, Any]) -> bool:
@@ -313,9 +321,6 @@ class FirebaseClient:
         safe_login = self.sanitize_key(login)
         acc_key = f"{user_id}_{safe_login}"
         token = await self.get_token()
-        url = f"{self.db_url}/accounts/{acc_key}.json"
-        if token:
-            url += f"?auth={token}"
 
         data = {
             "discord_user_id": int(user_id),
@@ -328,16 +333,33 @@ class FirebaseClient:
             "created_at": acc.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.put(url, json=data, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
-                    if res.status in (200, 204):
-                        logger.info(f"☁️ [FIREBASE-ACCOUNT] Zapisano konto w chmurze: {login} (user: {user_id})")
-                        return True
-                    else:
-                        logger.error(f"Błąd zapisu konta {login} do Firebase: status {res.status}")
-        except Exception as e:
-            logger.error(f"Wyjątek podczas zapisu konta {login} do Firebase: {e}")
+        # Używamy ścieżki pod /words/_accounts (reguły bazy zezwalają na zapis pod /words)
+        paths_to_try = ["words/_accounts", "accounts"]
+        for path in paths_to_try:
+            for attempt in range(2):
+                url = f"{self.db_url}/{path}/{acc_key}.json"
+                if token:
+                    url += f"?auth={token}"
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.put(url, json=data, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                            if res.status in (200, 204):
+                                logger.info(f"☁️ [FIREBASE-ACCOUNT] Zapisano konto w chmurze ({path}): {login} (user: {user_id})")
+                                return True
+                            elif res.status == 401:
+                                if attempt == 0:
+                                    token = await self.get_token(force_refresh=True)
+                                    continue
+                                else:
+                                    # 401 na tej ścieżce -> spróbuj kolejną ścieżkę
+                                    break
+                            else:
+                                logger.error(f"Błąd zapisu konta {login} do Firebase ({path}): status {res.status}")
+                                break
+                except Exception as e:
+                    logger.error(f"Wyjątek podczas zapisu konta {login} do Firebase ({path}): {e}")
+                    break
         return False
 
     async def delete_account_cloud(self, discord_user_id: int, login: str) -> bool:
@@ -345,16 +367,21 @@ class FirebaseClient:
         safe_login = self.sanitize_key(str(login).strip())
         acc_key = f"{discord_user_id}_{safe_login}"
         token = await self.get_token()
-        url = f"{self.db_url}/accounts/{acc_key}.json"
-        if token:
-            url += f"?auth={token}"
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.delete(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
-                    if res.status in (200, 204):
-                        logger.info(f"☁️ [FIREBASE-ACCOUNT] Usunięto konto z chmury: {login} (user: {discord_user_id})")
-                        return True
-        except Exception as e:
-            logger.error(f"Błąd usuwania konta {login} z Firebase: {e}")
+        for path in ["words/_accounts", "accounts"]:
+            for attempt in range(2):
+                url = f"{self.db_url}/{path}/{acc_key}.json"
+                if token:
+                    url += f"?auth={token}"
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.delete(url, timeout=aiohttp.ClientTimeout(total=8.0)) as res:
+                            if res.status in (200, 204):
+                                logger.info(f"☁️ [FIREBASE-ACCOUNT] Usunięto konto z chmury ({path}): {login}")
+                                return True
+                            elif res.status == 401 and attempt == 0:
+                                token = await self.get_token(force_refresh=True)
+                                continue
+                except Exception as e:
+                    logger.error(f"Błąd usuwania konta {login} z Firebase ({path}): {e}")
         return False

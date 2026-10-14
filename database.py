@@ -239,8 +239,9 @@ async def sync_with_firebase(firebase_client) -> dict:
         for local_acc in get_all_accounts():
             norm_key = (int(local_acc["discord_user_id"]), local_acc["login"].strip().lower())
             if norm_key not in cloud_keys:
-                await firebase_client.save_account_cloud(local_acc)
-                stats["uploaded"] += 1
+                ok = await firebase_client.save_account_cloud(local_acc)
+                if ok:
+                    stats["uploaded"] += 1
 
         all_now = get_all_accounts()
         stats["total"] = len(all_now)
