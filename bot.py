@@ -367,14 +367,25 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
                 pass
             await asyncio.sleep(pause_time)
 
-    # Podsumowanie
-    success_count = sum(1 for _, r in results if r["success"])
-    summary_embed = discord.Embed(
+    # Podsumowanie z obsługą limitu 25 pól na embed
+    success_count = sum(1 for _, r in results if r.get("success"))
+    embeds = []
+    current_embed = discord.Embed(
         title=f"📋 Raport z Sesji InstaLing ({success_count}/{total} zakończonych)",
         color=discord.Color.green() if success_count == total else discord.Color.orange()
     )
 
+    field_count = 0
     for acc_login, res in results:
+        if field_count >= 24:
+            current_embed.set_footer(text="InstaLing AutoBot • dc.zinzelekk")
+            embeds.append(current_embed)
+            current_embed = discord.Embed(
+                title=f"📋 Raport z Sesji InstaLing (cd.)",
+                color=discord.Color.green() if success_count == total else discord.Color.orange()
+            )
+            field_count = 0
+
         lang_tag = res.get("language", "EN")
         if res.get("already_done"):
             val = "ℹ️ **Dzisiejsza sesja była już wykonana!**"
@@ -382,17 +393,48 @@ async def sesja(interaction: discord.Interaction, konto: str = None, wszystkie: 
             val = f"✅ Poprawne: **{res['correct_words']}/{res['total_words']}** | Nowe: **+{res['learned_words']}** | Czas: `{res['time_seconds']}s`"
         else:
             val = f"❌ {res['message']}"
-        summary_embed.add_field(name=f"👤 `{acc_login}` [{lang_tag}]", value=val, inline=False)
+        current_embed.add_field(name=f"👤 `{acc_login}` [{lang_tag}]", value=val, inline=False)
+        field_count += 1
 
     if expired_logins:
-        summary_embed.add_field(
+        current_embed.add_field(
             name="⚠️ Pominięte konta (wygasłe)",
             value=", ".join([f"`{l}`" for l in expired_logins]),
             inline=False
         )
 
-    summary_embed.set_footer(text="InstaLing AutoBot • dc.zinzelekk")
-    await msg.edit(embed=summary_embed)
+    current_embed.set_footer(text="InstaLing AutoBot • dc.zinzelekk")
+    embeds.append(current_embed)
+
+    # Próba edycji pierwotnej wiadomości interakcji; w razie wygaśnięcia tokena (15 min) wysłanie nowej wiadomości
+    try:
+        await msg.edit(embed=embeds[0])
+        for extra_embed in embeds[1:]:
+            if interaction.channel:
+                await interaction.channel.send(embed=extra_embed)
+            elif interaction.user:
+                await interaction.user.send(embed=extra_embed)
+    except Exception as e:
+        logger.warning(f"Nie udało się zaktualizować webhooka interakcji ({e}). Wysyłam nowy raport...")
+        sent = False
+        if interaction.channel:
+            try:
+                await interaction.channel.send(
+                    content=f"{interaction.user.mention} 📋 Raport z sesji InstaLing:",
+                    embeds=embeds[:10]
+                )
+                sent = True
+            except Exception as e_chan:
+                logger.error(f"Nie udało się wysłać raportu na kanał: {e_chan}")
+
+        if not sent and interaction.user:
+            try:
+                await interaction.user.send(
+                    content="📋 Raport z sesji InstaLing (przekroczono limit czasu webhooka):",
+                    embeds=embeds[:10]
+                )
+            except Exception as e_user:
+                logger.error(f"Nie udało się wysłać raportu na DM: {e_user}")
 
 @bot.tree.command(name="baza", description="Sprawdź liczbę zapamiętanych słówek w bazie Firebase")
 async def baza(interaction: discord.Interaction):
