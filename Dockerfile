@@ -17,6 +17,9 @@ COPY . .
 # Wymuszenie trybu headless w chmurze
 ENV HEADLESS=True
 ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
+
+EXPOSE 8080
 
 # Uruchomienie bota
 CMD ["python", "bot.py"]

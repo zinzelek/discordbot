@@ -1,4 +1,5 @@
 import logging
+import os
 import asyncio
 import random
 import time
@@ -6,6 +7,7 @@ from datetime import datetime, timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands
+from aiohttp import web
 
 import config
 import database
@@ -25,6 +27,30 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 firebase_client = FirebaseClient()
 solver = InstaLingSolver(firebase_client, headless=config.HEADLESS)
 scheduler = SessionScheduler(bot, solver, firebase_client)
+
+async def start_health_server():
+    """Uruchamia lekki serwer HTTP dla health-checków na platformach chmurowych (Fly.io, Render itp.)"""
+    port = int(os.environ.get("PORT", 8080))
+    try:
+        app = web.Application()
+
+        async def handle_ping(request):
+            return web.Response(text="OK - InstaLing Discord Bot is alive! 🤖", content_type="text/plain")
+
+        app.router.add_get("/", handle_ping)
+        app.router.add_get("/health", handle_ping)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"🌐 Serwer HTTP Health-Check aktywny na 0.0.0.0:{port}")
+    except Exception as e:
+        logger.warning(f"⚠️ Nie udało się uruchomić serwera HTTP (port {port}): {e}")
+
+@bot.event
+async def setup_hook():
+    asyncio.create_task(start_health_server())
 
 @bot.event
 async def on_ready():
